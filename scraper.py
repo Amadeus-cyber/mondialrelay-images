@@ -1,426 +1,428 @@
 #!/usr/bin/env python3
+"""ZeuScraper — CLI interactif avec animations et navigation."""
 
-import re
-import sys
 import os
-import gzip
-import json
+import sys
 import time
-import ipaddress
 import threading
-from urllib.parse import urlparse, urljoin
 
 try:
+    from core import (scrape_index, scrape_url, scrape_bgp, scrape_ripe,
+                      extract, save_files, build_lists)
     import requests
     from bs4 import BeautifulSoup
 except ImportError:
     print("Missing deps. Run: pip install requests beautifulsoup4")
     sys.exit(1)
 
-# ── ANSI colors ───────────────────────────────────────────────────────────────
+# ── ANSI ──────────────────────────────────────────────────────────────────────
 
-R  = "\033[91m"
-G  = "\033[92m"
-Y  = "\033[93m"
-B  = "\033[94m"
-M  = "\033[95m"
-C  = "\033[96m"
-W  = "\033[97m"
-DIM = "\033[2m"
-RST = "\033[0m"
+R    = "\033[91m"
+G    = "\033[92m"
+Y    = "\033[93m"
+B    = "\033[94m"
+M    = "\033[95m"
+C    = "\033[96m"
+W    = "\033[97m"
+DIM  = "\033[2m"
 BOLD = "\033[1m"
+RST  = "\033[0m"
 
-def c(color, text): return f"{color}{text}{RST}"
+def col(color, text): return f"{color}{text}{RST}"
 
-# ── Banner ────────────────────────────────────────────────────────────────────
+CLR = "\033[2J\033[H"   # clear screen + cursor home
 
-BANNER = f"""
-{R}██████╗ {Y}██████╗ {G} ██████╗{C}██╗  ██╗{M}███████╗{RST}
-{R}╚════██╗{Y}╚════██╗{G}██╔════╝{C}██║ ██╔╝{M}██╔════╝{RST}
-{R} █████╔╝{Y} █████╔╝{G}╚█████╗ {C}█████╔╝ {M}█████╗  {RST}
-{R}██╔═══╝ {Y}╚════██╗{G} ╚═══██╗{C}██╔═██╗ {M}██╔══╝  {RST}
-{R}███████╗{Y}██████╔╝{G}██████╔╝{C}██║  ██╗{M}███████╗{RST}
-{R}╚══════╝{Y}╚═════╝ {G}╚═════╝ {C}╚═╝  ╚═╝{M}╚══════╝{RST}
+# ── Settings (modifiables via menu Paramètres) ────────────────────────────────
 
-{DIM}        Domain & IP Range Scraper{RST}
-{DIM}        by ZEU  •  v2.0{RST}
-"""
+CFG = {
+    "workers":  5,
+    "timeout":  30,
+    "exts":     "txt,gz",
+    "limit":    0,
+    "dout":     "domains.txt",
+    "iout":     "ips.txt",
+    "depth":    2,
+}
 
-MENU = f"""
-{BOLD}{W}  ╔══════════════════════════════════════╗{RST}
-{BOLD}{W}  ║          {C}CHOISIR UN MODE{W}             ║{RST}
-{BOLD}{W}  ╠══════════════════════════════════════╣{RST}
-{BOLD}{W}  ║  {G}[1]{W} Index Apache   {DIM}(répertoire){W}      ║{RST}
-{BOLD}{W}  ║  {G}[2]{W} URL directe    {DIM}(page / fichier){W}  ║{RST}
-{BOLD}{W}  ║  {G}[3]{W} Source BGP     {DIM}(ASN → CIDRs){W}    ║{RST}
-{BOLD}{W}  ║  {G}[4]{W} Source RIPE    {DIM}(org → CIDRs){W}    ║{RST}
-{BOLD}{W}  ║  {R}[0]{W} Quitter                          ║{RST}
-{BOLD}{W}  ╚══════════════════════════════════════╝{RST}
-"""
+# ── ASCII Banner ──────────────────────────────────────────────────────────────
 
-# ── Regex patterns ────────────────────────────────────────────────────────────
+BANNER_LINES = [
+    f"{R} ███████╗{Y}███████╗{G}██╗   ██╗{C}███████╗{M}██████╗ {RST}",
+    f"{R} ╚══███╔╝{Y}██╔════╝{G}██║   ██║{C}██╔════╝{M}██╔══██╗{RST}",
+    f"{R}   ███╔╝ {Y}█████╗  {G}██║   ██║{C}███████╗{M}██████╔╝{RST}",
+    f"{R}  ███╔╝  {Y}██╔══╝  {G}██║   ██║{C}╚════██║{M}██╔══██╗{RST}",
+    f"{R} ███████╗{Y}███████╗{G}╚██████╔╝{C}███████║{M}██║  ██║{RST}",
+    f"{R} ╚══════╝{Y}╚══════╝{G} ╚═════╝ {C}╚══════╝{M}╚═╝  ╚═╝{RST}",
+    f"",
+    f"{DIM}   ──────────────────────────────────────────{RST}",
+    f"{BOLD}{W}        ZeuScraper  {DIM}v3.0  •  Domain & IP{RST}",
+    f"{DIM}   ──────────────────────────────────────────{RST}",
+]
 
-CIDR_RE = re.compile(
-    r'\b(?:\d{1,3}\.){3}\d{1,3}/\d{1,2}\b'
-    r'|'
-    r'(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}/\d{1,3}'
-)
+def print_banner(animate=True):
+    print(CLR, end="")
+    for line in BANNER_LINES:
+        print(f"  {line}")
+        if animate:
+            time.sleep(0.04)
+    print()
 
-IPV4_RE = re.compile(
-    r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b'
-)
+# ── Spinner ───────────────────────────────────────────────────────────────────
 
-DOMAIN_RE = re.compile(
-    r'\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)'
-    r'+(?:com|net|org|io|fr|de|uk|ru|cn|info|biz|co|xyz|online|site|top|'
-    r'cloud|tech|app|dev|edu|gov|mil|int|eu|us|ca|au|jp|br|in|nl|es|it|pl|'
-    r'se|no|dk|fi|be|ch|at|cz|ro|hu|sk|bg|hr|si|lt|lv|ee|is|pt|gr|tr|il|'
-    r'ua|by|kz|ge|am|az|md|rs|me|mk|al|ba|xk|ly|gg|je|im|ax|mobi|cc|'
-    r'tv|pro|name|ws|ms|nu|pw|academy|agency|blog|club|design|email|'
-    r'global|group|host|link|live|media|news|network|one|plus|shop|social|'
-    r'store|studio|support|systems|today|web|works|world|zone)\b',
-    re.IGNORECASE
-)
+class Spinner:
+    FRAMES = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+    def __init__(self, label=""):
+        self.label   = label
+        self._stop   = threading.Event()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
 
-# ── HTTP ──────────────────────────────────────────────────────────────────────
+    def _spin(self):
+        i = 0
+        while not self._stop.is_set():
+            frame = self.FRAMES[i % len(self.FRAMES)]
+            print(f"\r  {C}{frame}{RST} {self.label}  ", end="", flush=True)
+            time.sleep(0.08)
+            i += 1
 
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-})
+    def __enter__(self):
+        self._thread.start()
+        return self
 
-
-def fetch(url: str, retries: int = 3, timeout: int = 30) -> requests.Response | None:
-    for attempt in range(retries):
-        try:
-            r = SESSION.get(url, timeout=timeout)
-            r.raise_for_status()
-            return r
-        except requests.RequestException as e:
-            info(f"Tentative {attempt+1}/{retries} échouée : {e}", R)
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt)
-    return None
+    def __exit__(self, *_):
+        self._stop.set()
+        self._thread.join()
+        print(f"\r{' '*60}\r", end="", flush=True)
 
 
-def decode_response(resp: requests.Response, url: str) -> str:
-    if url.endswith(".gz") or "gzip" in resp.headers.get("Content-Type", ""):
-        try:
-            return gzip.decompress(resp.content).decode("utf-8", errors="replace")
-        except Exception:
-            pass
-    return resp.text
+# ── Barre de progression ──────────────────────────────────────────────────────
 
-
-# ── Extraction ────────────────────────────────────────────────────────────────
-
-def extract(text: str) -> dict:
-    cidrs   = set(CIDR_RE.findall(text))
-    ips     = set(IPV4_RE.findall(text)) - {c.split('/')[0] for c in cidrs}
-    domains = set(DOMAIN_RE.findall(text))
-
-    valid_cidrs = set()
-    for cidr in cidrs:
-        try:
-            ipaddress.ip_network(cidr, strict=False)
-            valid_cidrs.add(cidr)
-        except ValueError:
-            pass
-
-    valid_ips = set()
-    for ip in ips:
-        try:
-            ipaddress.ip_address(ip)
-            valid_ips.add(ip)
-        except ValueError:
-            pass
-
-    return {"cidrs": valid_cidrs, "ips": valid_ips, "domains": domains}
+def progress_bar(done, total, width=30):
+    pct  = done / total if total else 0
+    fill = int(width * pct)
+    bar  = f"{G}{'█' * fill}{DIM}{'░' * (width - fill)}{RST}"
+    return f"[{bar}] {W}{done}/{total}{RST} ({pct*100:.0f}%)"
 
 
 # ── UI helpers ────────────────────────────────────────────────────────────────
 
-def info(msg, color=C):
-    print(f"  {color}>{RST} {msg}")
+def info(msg):  print(f"  {C}›{RST} {msg}")
+def ok(msg):    print(f"  {G}✔{RST} {msg}")
+def err(msg):   print(f"  {R}✘{RST} {msg}")
+def warn(msg):  print(f"  {Y}⚠{RST} {msg}")
+def sep():      print(f"\n  {DIM}{'─'*46}{RST}\n")
 
-def ok(msg):
-    print(f"  {G}✔{RST} {msg}")
+BACK_CMDS = {"b", "back", "retour", "r"}
 
-def err(msg):
-    print(f"  {R}✘{RST} {msg}")
-
-def ask(prompt, default=""):
-    val = input(f"  {Y}?{RST} {prompt}{DIM}{'['+default+'] ' if default else ''}{RST}: ").strip()
+def ask(prompt, default="", secret=False):
+    """Retourne None si l'utilisateur tape 'b' pour revenir en arrière."""
+    hint = f" {DIM}[{default}]{RST}" if default else ""
+    back = f"  {DIM}(b = retour){RST}"
+    try:
+        val = input(f"  {Y}›{RST} {BOLD}{prompt}{RST}{hint}{back} : ").strip()
+    except (KeyboardInterrupt, EOFError):
+        return None
+    if val.lower() in BACK_CMDS:
+        return None
     return val if val else default
 
-def separator():
-    print(f"\n  {DIM}{'─'*44}{RST}\n")
+
+def pause():
+    try:
+        input(f"\n  {DIM}[ Entrée pour continuer... ]{RST}")
+    except (KeyboardInterrupt, EOFError):
+        pass
 
 
-# ── Modes ─────────────────────────────────────────────────────────────────────
+# ── Menus ─────────────────────────────────────────────────────────────────────
 
-def scrape_index(index_url: str, exts: list, limit: int, workers: int) -> dict:
-    info(f"Récupération de l'index : {c(C, index_url)}")
-    resp = fetch(index_url)
-    if not resp:
-        err("Impossible d'accéder à l'index.")
-        return {}
+MAIN_MENU = f"""
+{BOLD}{W}  ╔══════════════════════════════════════════╗
+  ║         {C}  Z E U S C R A P E R {W}            ║
+  ╠══════════════════════════════════════════╣
+  ║  {G}[1]{W}  Index Apache    {DIM}(répertoire web){W}     ║
+  ║  {G}[2]{W}  URL directe     {DIM}(page / fichier){W}     ║
+  ║  {G}[3]{W}  Source BGP      {DIM}(ASN → CIDRs){W}       ║
+  ║  {G}[4]{W}  Source RIPE     {DIM}(org → CIDRs){W}       ║
+  ║  {Y}[5]{W}  Paramètres      {DIM}(config défaut){W}      ║
+  ║  {R}[0]{W}  Quitter                              ║
+  ╚══════════════════════════════════════════╝{RST}
+"""
 
-    soup  = BeautifulSoup(resp.text, "html.parser")
-    base  = index_url.rstrip("/") + "/"
-    files = []
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if href.startswith("?") or href in ("../", "./", "/"):
-            continue
-        full = urljoin(base, href)
-        if urlparse(full).netloc != urlparse(index_url).netloc:
-            continue
-        ext = href.split("?")[0].rsplit(".", 1)[-1].lower()
-        if ext in exts:
-            files.append(full)
+def show_cfg():
+    sep()
+    print(f"  {BOLD}{W}Paramètres actuels :{RST}\n")
+    print(f"   {C}workers{RST}  = {W}{CFG['workers']}{RST}   {DIM}(threads parallèles){RST}")
+    print(f"   {C}timeout{RST}  = {W}{CFG['timeout']}s{RST}")
+    print(f"   {C}exts{RST}     = {W}{CFG['exts']}{RST}")
+    print(f"   {C}limit{RST}    = {W}{CFG['limit'] or 'aucun'}{RST}")
+    print(f"   {C}depth{RST}    = {W}{CFG['depth']}{RST}")
+    print(f"   {C}dout{RST}     = {W}{CFG['dout']}{RST}")
+    print(f"   {C}iout{RST}     = {W}{CFG['iout']}{RST}")
+    sep()
 
-    ok(f"{len(files)} fichier(s) trouvé(s) avec extensions {exts}")
 
-    if limit and limit < len(files):
-        files = files[:limit]
-        info(f"Limité à {limit} fichiers")
+def menu_params():
+    while True:
+        show_cfg()
+        print(f"  {BOLD}{W}Que modifier ?{RST}\n")
+        print(f"   {G}[1]{RST} Workers (threads)   {G}[2]{RST} Timeout")
+        print(f"   {G}[3]{RST} Extensions          {G}[4]{RST} Limite fichiers")
+        print(f"   {G}[5]{RST} Profondeur liens    {G}[6]{RST} Fichier domaines")
+        print(f"   {G}[7]{RST} Fichier IPs         {R}[0]{RST} Retour\n")
 
-    results = {"cidrs": set(), "ips": set(), "domains": set()}
-    lock    = threading.Lock()
-    done    = [0]
-    total   = len(files)
-
-    def process(url):
-        r = fetch(url, timeout=60)
-        if not r:
+        ch = ask("Choix", "0")
+        if ch is None or ch == "0":
             return
-        data = extract(decode_response(r, url))
-        with lock:
-            results["cidrs"]   |= data["cidrs"]
-            results["ips"]     |= data["ips"]
-            results["domains"] |= data["domains"]
-            done[0] += 1
-            fname = url.split("/")[-1][:35]
-            print(f"  {G}[{done[0]:>3}/{total}]{RST} {fname:<36} "
-                  f"{C}+{len(data['domains'])} dom{RST}  "
-                  f"{M}+{len(data['cidrs'])} cidr{RST}")
 
-    sem     = threading.Semaphore(workers)
-    threads = []
-
-    def worker(url):
-        with sem:
-            process(url)
-
-    for url in files:
-        t = threading.Thread(target=worker, args=(url,), daemon=True)
-        threads.append(t)
-        t.start()
-    for t in threads:
-        t.join()
-
-    return results
-
-
-def scrape_url(url: str, follow: bool, depth: int) -> dict:
-    results = {"cidrs": set(), "ips": set(), "domains": set()}
-    visited = set()
-
-    def _scrape(target: str, d: int):
-        if target in visited or d > depth:
-            return
-        visited.add(target)
-        info(f"Fetch : {c(C, target)}")
-        resp = fetch(target)
-        if not resp:
-            return
-        text = decode_response(resp, target)
-        ct   = resp.headers.get("Content-Type", "")
-        if "text/plain" in ct or target.endswith((".txt", ".gz", ".csv")):
-            data = extract(text)
-        else:
-            soup = BeautifulSoup(text, "html.parser")
-            for tag in soup(["script", "style"]):
-                tag.decompose()
-            data = extract(soup.get_text(separator="\n"))
-            if follow and d < depth:
-                base = urlparse(target)
-                for a in soup.find_all("a", href=True):
-                    href = urljoin(target, a["href"])
-                    if urlparse(href).netloc == base.netloc:
-                        _scrape(href, d + 1)
-        results["cidrs"]   |= data["cidrs"]
-        results["ips"]     |= data["ips"]
-        results["domains"] |= data["domains"]
+        if ch == "1":
+            v = ask("Nombre de workers", str(CFG["workers"]))
+            if v:
+                try:
+                    CFG["workers"] = max(1, min(50, int(v)))
+                    ok(f"Workers → {CFG['workers']}")
+                except ValueError:
+                    err("Valeur invalide")
+        elif ch == "2":
+            v = ask("Timeout (secondes)", str(CFG["timeout"]))
+            if v:
+                try:
+                    CFG["timeout"] = max(5, int(v))
+                    ok(f"Timeout → {CFG['timeout']}s")
+                except ValueError:
+                    err("Valeur invalide")
+        elif ch == "3":
+            v = ask("Extensions (ex: txt,gz)", CFG["exts"])
+            if v:
+                CFG["exts"] = v
+                ok(f"Extensions → {CFG['exts']}")
+        elif ch == "4":
+            v = ask("Limite (0 = aucune)", str(CFG["limit"]))
+            if v is not None:
+                try:
+                    CFG["limit"] = max(0, int(v))
+                    ok(f"Limite → {CFG['limit'] or 'aucune'}")
+                except ValueError:
+                    err("Valeur invalide")
+        elif ch == "5":
+            v = ask("Profondeur", str(CFG["depth"]))
+            if v:
+                try:
+                    CFG["depth"] = max(1, int(v))
+                    ok(f"Profondeur → {CFG['depth']}")
+                except ValueError:
+                    err("Valeur invalide")
+        elif ch == "6":
+            v = ask("Fichier domaines", CFG["dout"])
+            if v:
+                CFG["dout"] = v
+                ok(f"dout → {CFG['dout']}")
+        elif ch == "7":
+            v = ask("Fichier IPs", CFG["iout"])
+            if v:
+                CFG["iout"] = v
+                ok(f"iout → {CFG['iout']}")
         time.sleep(0.3)
 
-    _scrape(url, 1)
-    return results
+
+# ── Affichage résultat ────────────────────────────────────────────────────────
+
+def show_results(results, dout, iout):
+    nd, ni = save_files(results, dout, iout)
+    sep()
+    print(f"  {BOLD}{G}── Résultats ──────────────────────────────{RST}")
+    print(f"  {G}✔{RST}  Domaines   → {col(C, dout):30}  {col(W, str(nd))} entrées")
+    print(f"  {G}✔{RST}  IPs/CIDRs  → {col(C, iout):30}  {col(W, str(ni))} entrées")
+
+    domains, all_ips = build_lists(results)
+    if domains:
+        sep()
+        print(f"  {DIM}Aperçu domaines (5 premiers) :{RST}")
+        for d in domains[:5]:
+            print(f"    {G}·{RST} {d}")
+    if all_ips:
+        print(f"\n  {DIM}Aperçu IPs/CIDRs (5 premiers) :{RST}")
+        for ip in all_ips[:5]:
+            print(f"    {M}·{RST} {ip}")
+    sep()
 
 
-def scrape_bgp(asn: str) -> dict:
-    asn  = asn.upper().replace("AS", "")
-    url  = f"https://bgp.he.net/AS{asn}#_prefixes"
-    info(f"BGP.HE.NET — AS{asn}")
-    resp = fetch(url)
-    if not resp:
-        return {}
-    soup  = BeautifulSoup(resp.text, "html.parser")
-    cidrs = set()
-    for row in soup.select("table#table_prefixes4 td a, table#table_prefixes6 td a"):
-        t = row.get_text(strip=True)
-        try:
-            ipaddress.ip_network(t, strict=False)
-            cidrs.add(t)
-        except ValueError:
-            pass
-    return {"cidrs": cidrs, "ips": set(), "domains": set()}
+# ── Mode 1 : Index Apache ─────────────────────────────────────────────────────
+
+def mode_index():
+    sep()
+    print(f"  {BOLD}{C}── Index Apache ──────────────────────────{RST}\n")
+
+    url = ask("URL de l'index")
+    if url is None: return
+
+    exts_str = ask("Extensions", CFG["exts"])
+    if exts_str is None: return
+    exts = [e.strip().lstrip(".").lower() for e in exts_str.split(",")]
+
+    wrk_str = ask("Workers (threads parallèles)", str(CFG["workers"]))
+    if wrk_str is None: return
+    try: workers = max(1, min(50, int(wrk_str)))
+    except ValueError: workers = CFG["workers"]
+
+    lim_str = ask("Limite fichiers (0 = tous)", str(CFG["limit"]))
+    if lim_str is None: return
+    try: limit = max(0, int(lim_str))
+    except ValueError: limit = CFG["limit"]
+
+    dout = ask("Fichier domaines", CFG["dout"])
+    if dout is None: return
+    iout = ask("Fichier IPs", CFG["iout"])
+    if iout is None: return
+
+    sep()
+    info(f"Connexion à l'index…")
+
+    _done_total = [0, 0]
+    _dom_total  = [0]
+    _ip_total   = [0]
+
+    def progress_cb(done, total, file_url, data):
+        _done_total[0] = done
+        _done_total[1] = total
+        _dom_total[0] += len(data["domains"])
+        _ip_total[0]  += len(data["cidrs"]) + len(data["ips"])
+        fname = file_url.split("/")[-1][:32]
+        bar   = progress_bar(done, total)
+        print(f"\r  {bar}  {DIM}{fname:<33}{RST}  "
+              f"{G}dom:{_dom_total[0]}{RST}  {M}ip:{_ip_total[0]}{RST}   ",
+              end="", flush=True)
+
+    results, total = scrape_index(url, exts, limit, workers, progress_cb)
+    print()  # newline after progress bar
+
+    if not results:
+        err("Aucun résultat.")
+        return
+
+    show_results(results, dout, iout)
 
 
-def scrape_ripe(query: str) -> dict:
-    info(f"RIPE NCC — {query}")
-    url  = (f"https://rest.db.ripe.net/search.json?query-string={query}"
-            f"&type-filter=inetnum,inet6num&flags=no-filtering")
-    resp = fetch(url)
-    if not resp:
-        return {}
-    try:
-        data  = resp.json()
-        cidrs = set()
-        for obj in data.get("objects", {}).get("object", []):
-            for attr in obj.get("attributes", {}).get("attribute", []):
-                if attr.get("name") in ("inetnum", "inet6num"):
-                    val = attr.get("value", "")
-                    if " - " in val:
-                        try:
-                            s, e = val.split(" - ")
-                            for net in ipaddress.summarize_address_range(
-                                ipaddress.ip_address(s.strip()),
-                                ipaddress.ip_address(e.strip())
-                            ):
-                                cidrs.add(str(net))
-                        except Exception:
-                            pass
-                    else:
-                        try:
-                            ipaddress.ip_network(val, strict=False)
-                            cidrs.add(val)
-                        except ValueError:
-                            pass
-        return {"cidrs": cidrs, "ips": set(), "domains": set()}
-    except (json.JSONDecodeError, KeyError):
-        return extract(resp.text)
+# ── Mode 2 : URL directe ─────────────────────────────────────────────────────
+
+def mode_url():
+    sep()
+    print(f"  {BOLD}{C}── URL directe ───────────────────────────{RST}\n")
+
+    url = ask("URL cible")
+    if url is None: return
+
+    follow_str = ask("Suivre les liens internes ? (o/n)", "n")
+    if follow_str is None: return
+    follow = follow_str.lower() == "o"
+
+    depth = CFG["depth"]
+    if follow:
+        d_str = ask("Profondeur", str(CFG["depth"]))
+        if d_str is None: return
+        try: depth = max(1, int(d_str))
+        except ValueError: pass
+
+    wrk_str = ask("Workers", str(CFG["workers"]))
+    if wrk_str is None: return
+    try: workers = max(1, min(50, int(wrk_str)))
+    except ValueError: workers = CFG["workers"]
+
+    dout = ask("Fichier domaines", CFG["dout"])
+    if dout is None: return
+    iout = ask("Fichier IPs", CFG["iout"])
+    if iout is None: return
+
+    sep()
+    with Spinner(f"Scraping {url[:50]}…"):
+        results = scrape_url(url, follow=follow, depth=depth, workers=workers)
+    print()
+
+    if not results:
+        err("Aucun résultat.")
+        return
+
+    show_results(results, dout, iout)
 
 
-# ── Save ──────────────────────────────────────────────────────────────────────
+# ── Mode 3 : BGP ─────────────────────────────────────────────────────────────
 
-def save(results: dict, dout: str, iout: str):
-    def s_cidr(x):
-        try:
-            return ipaddress.ip_network(x, strict=False)
-        except ValueError:
-            return ipaddress.ip_network("0.0.0.0/32")
+def mode_bgp():
+    sep()
+    print(f"  {BOLD}{C}── BGP.HE.NET ────────────────────────────{RST}\n")
 
-    all_ips = (
-        sorted(results.get("cidrs", []), key=s_cidr) +
-        sorted(results.get("ips",   []), key=lambda x: ipaddress.ip_address(x))
-    )
-    domains = sorted(results.get("domains", []))
+    asn = ask("Numéro ASN (ex: 15169)")
+    if asn is None: return
 
-    with open(dout, "w") as f:
-        f.write("\n".join(domains) + "\n")
-    with open(iout, "w") as f:
-        f.write("\n".join(all_ips) + "\n")
+    dout = ask("Fichier IPs/CIDRs", CFG["iout"])
+    if dout is None: return
 
-    separator()
-    ok(f"Domaines  → {c(G, dout)}  ({c(W, str(len(domains)))} entrées)")
-    ok(f"IPs/CIDRs → {c(G, iout)}  ({c(W, str(len(all_ips)))} entrées)")
+    sep()
+    with Spinner(f"Requête BGP AS{asn.upper().replace('AS','')}…"):
+        results = scrape_bgp(asn)
+    print()
+
+    if not results:
+        err("Aucun résultat.")
+        return
+
+    show_results(results, CFG["dout"], dout)
 
 
-# ── Main interactive loop ─────────────────────────────────────────────────────
+# ── Mode 4 : RIPE ────────────────────────────────────────────────────────────
+
+def mode_ripe():
+    sep()
+    print(f"  {BOLD}{C}── RIPE NCC ──────────────────────────────{RST}\n")
+
+    query = ask("Recherche (org / IP / réseau)")
+    if query is None: return
+
+    dout = ask("Fichier IPs/CIDRs", CFG["iout"])
+    if dout is None: return
+
+    sep()
+    with Spinner(f"Requête RIPE : {query}…"):
+        results = scrape_ripe(query)
+    print()
+
+    if not results:
+        err("Aucun résultat.")
+        return
+
+    show_results(results, CFG["dout"], dout)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+MODES = {"1": mode_index, "2": mode_url, "3": mode_bgp, "4": mode_ripe}
 
 def main():
-    os.system("clear" if os.name != "nt" else "cls")
-    print(BANNER)
+    print_banner(animate=True)
 
     while True:
-        print(MENU)
-        choice = input(f"  {BOLD}{W}zeu@scraper{RST}{DIM}~${RST} ").strip()
+        print(MAIN_MENU)
+        try:
+            choice = input(f"  {BOLD}{W}zeuscraper{RST}{DIM}@zeu ~${RST} ").strip()
+        except (KeyboardInterrupt, EOFError):
+            choice = "0"
 
         if choice == "0":
-            print(f"\n  {DIM}Bye.{RST}\n")
+            print(f"\n  {DIM}À bientôt.{RST}\n")
             break
-
-        separator()
-
-        # ── Mode 1 : Apache index ──────────────────────────────────────────
-        if choice == "1":
-            url     = ask("URL de l'index Apache")
-            exts    = ask("Extensions à télécharger", "txt,gz")
-            limit_s = ask("Limite de fichiers (0 = tous)", "0")
-            workers = ask("Workers parallèles", "5")
-            dout    = ask("Fichier de sortie domaines", "domains.txt")
-            iout    = ask("Fichier de sortie IPs/CIDRs", "ips.txt")
-
-            if not url:
-                err("URL vide.")
-                continue
-
-            exts_list = [e.strip().lstrip(".").lower() for e in exts.split(",")]
-            results = scrape_index(url, exts_list, int(limit_s), int(workers))
-            save(results, dout, iout)
-
-        # ── Mode 2 : URL directe ──────────────────────────────────────────
-        elif choice == "2":
-            url    = ask("URL cible")
-            follow = ask("Suivre les liens internes ? (o/n)", "n").lower() == "o"
-            depth  = int(ask("Profondeur", "2")) if follow else 1
-            dout   = ask("Fichier de sortie domaines", "domains.txt")
-            iout   = ask("Fichier de sortie IPs/CIDRs", "ips.txt")
-
-            if not url:
-                err("URL vide.")
-                continue
-
-            results = scrape_url(url, follow, depth)
-            save(results, dout, iout)
-
-        # ── Mode 3 : BGP ──────────────────────────────────────────────────
-        elif choice == "3":
-            asn  = ask("Numéro ASN (ex: 15169 ou AS15169)")
-            dout = ask("Fichier de sortie domaines", "domains.txt")
-            iout = ask("Fichier de sortie IPs/CIDRs", "ips.txt")
-
-            if not asn:
-                err("ASN vide.")
-                continue
-
-            results = scrape_bgp(asn)
-            save(results, dout, iout)
-
-        # ── Mode 4 : RIPE ─────────────────────────────────────────────────
-        elif choice == "4":
-            query = ask("Recherche RIPE (org / IP / réseau)")
-            dout  = ask("Fichier de sortie domaines", "domains.txt")
-            iout  = ask("Fichier de sortie IPs/CIDRs", "ips.txt")
-
-            if not query:
-                err("Requête vide.")
-                continue
-
-            results = scrape_ripe(query)
-            save(results, dout, iout)
-
+        elif choice == "5":
+            print_banner(animate=False)
+            menu_params()
+            print_banner(animate=False)
+            continue
+        elif choice in MODES:
+            print_banner(animate=False)
+            MODES[choice]()
+            pause()
+            print_banner(animate=False)
         else:
             err("Choix invalide.")
-
-        input(f"\n  {DIM}[Entrée pour continuer...]{RST}")
-        os.system("clear" if os.name != "nt" else "cls")
-        print(BANNER)
+            time.sleep(0.5)
 
 
 if __name__ == "__main__":
