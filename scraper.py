@@ -8,7 +8,6 @@ Usage: python scraper.py --url <url> [options]
 
 import re
 import sys
-import csv
 import gzip
 import json
 import time
@@ -326,45 +325,26 @@ SOURCES = {
 
 # ── Output ───────────────────────────────────────────────────────────────────
 
-def save_results(results: dict, output: str, fmt: str):
+def save_results(results: dict, domains_out: str, ips_out: str):
     def sort_cidr(x):
         try:
             return ipaddress.ip_network(x, strict=False)
         except ValueError:
             return ipaddress.ip_network("0.0.0.0/32")
 
-    cidrs   = sorted(results.get("cidrs",   []), key=sort_cidr)
-    ips     = sorted(results.get("ips",     []), key=lambda x: ipaddress.ip_address(x))
+    all_ips = (
+        sorted(results.get("cidrs", []), key=sort_cidr) +
+        sorted(results.get("ips",   []), key=lambda x: ipaddress.ip_address(x))
+    )
     domains = sorted(results.get("domains", []))
 
-    if fmt == "txt":
-        with open(output, "w") as f:
-            if cidrs:
-                f.write("# IP RANGES (CIDR)\n")
-                f.write("\n".join(cidrs) + "\n\n")
-            if ips:
-                f.write("# INDIVIDUAL IPs\n")
-                f.write("\n".join(ips) + "\n\n")
-            if domains:
-                f.write("# DOMAINS\n")
-                f.write("\n".join(domains) + "\n")
+    with open(domains_out, "w") as f:
+        f.write("\n".join(domains) + "\n")
+    print(f"  Domains → {domains_out} ({len(domains)} entries)")
 
-    elif fmt == "csv":
-        with open(output, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["type", "value"])
-            for c in cidrs:
-                w.writerow(["cidr", c])
-            for i in ips:
-                w.writerow(["ip", i])
-            for d in domains:
-                w.writerow(["domain", d])
-
-    elif fmt == "json":
-        with open(output, "w") as f:
-            json.dump({"cidrs": cidrs, "ips": ips, "domains": domains}, f, indent=2)
-
-    print(f"  Saved → {output}")
+    with open(ips_out, "w") as f:
+        f.write("\n".join(all_ips) + "\n")
+    print(f"  IPs/CIDRs → {ips_out} ({len(all_ips)} entries)")
 
 
 def print_summary(results: dict):
@@ -376,25 +356,6 @@ def print_summary(results: dict):
     print(f"  Individual IPs   : {len(ips)}")
     print(f"  Domains          : {len(domains)}")
     print(f"{'─'*40}")
-
-    def sort_cidr(x):
-        try:
-            return ipaddress.ip_network(x, strict=False)
-        except ValueError:
-            return ipaddress.ip_network("0.0.0.0/32")
-
-    if cidrs:
-        print("\n[CIDR — first 20]")
-        for c in sorted(cidrs, key=sort_cidr)[:20]:
-            print(f"  {c}")
-        if len(cidrs) > 20:
-            print(f"  ... ({len(cidrs)-20} more)")
-    if domains:
-        print("\n[Domains — first 20]")
-        for d in sorted(domains)[:20]:
-            print(f"  {d}")
-        if len(domains) > 20:
-            print(f"  ... ({len(domains)-20} more)")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -436,8 +397,8 @@ Examples:
     parser.add_argument("--workers", type=int, default=5, help="Parallel download threads (default: 5)")
     parser.add_argument("--follow",  action="store_true", help="Follow internal links (--url mode)")
     parser.add_argument("--depth",   type=int, default=2, help="Link follow depth (default: 2)")
-    parser.add_argument("-o", "--output", default="results.txt", help="Output file (default: results.txt)")
-    parser.add_argument("--format",  choices=["txt", "csv", "json"], default="txt", help="Output format")
+    parser.add_argument("--domains-out", default="domains.txt", help="Output file for domains (default: domains.txt)")
+    parser.add_argument("--ips-out",     default="ips.txt",     help="Output file for IPs/CIDRs (default: ips.txt)")
 
     args = parser.parse_args()
 
@@ -477,7 +438,7 @@ Examples:
         results["domains"] |= data.get("domains", set())
 
     print_summary(results)
-    save_results(results, args.output, args.format)
+    save_results(results, args.domains_out, args.ips_out)
 
 
 if __name__ == "__main__":
