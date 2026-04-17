@@ -102,6 +102,8 @@ def scrape_index(index_url: str, exts: list, limit: int, workers: int,
     base  = index_url.rstrip("/") + "/"
     files = []
 
+    all_exts = not exts or exts == ["*"] or exts == ["all"]
+
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if href.startswith("?") or href in ("../", "./", "/"):
@@ -109,8 +111,11 @@ def scrape_index(index_url: str, exts: list, limit: int, workers: int,
         full = urljoin(base, href)
         if urlparse(full).netloc != urlparse(index_url).netloc:
             continue
-        ext = href.split("?")[0].rsplit(".", 1)[-1].lower()
-        if ext in exts:
+        name = href.split("?")[0]
+        if name.endswith("/"):
+            continue
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        if all_exts or ext in exts:
             files.append(full)
 
     if limit and limit < len(files):
@@ -277,7 +282,19 @@ def build_lists(results: dict) -> tuple[list, list]:
     return domains, all_ips
 
 
+def resolve_path(directory: str, filename: str) -> str:
+    """Combine un dossier de sortie et un nom de fichier."""
+    import os
+    if directory and directory not in (".", ""):
+        os.makedirs(directory, exist_ok=True)
+        return os.path.join(directory, filename)
+    return filename
+
+
 def save_files(results: dict, dout: str, iout: str) -> tuple[int, int]:
+    import os
+    os.makedirs(os.path.dirname(os.path.abspath(dout)), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(iout)), exist_ok=True)
     domains, all_ips = build_lists(results)
     with open(dout, "w") as f:
         f.write("\n".join(domains) + "\n")

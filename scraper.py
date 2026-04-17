@@ -8,7 +8,7 @@ import threading
 
 try:
     from core import (scrape_index, scrape_url, scrape_bgp, scrape_ripe,
-                      extract, save_files, build_lists)
+                      extract, save_files, build_lists, resolve_path)
     import requests
     from bs4 import BeautifulSoup
 except ImportError:
@@ -42,6 +42,7 @@ CFG = {
     "dout":     "domains.txt",
     "iout":     "ips.txt",
     "depth":    2,
+    "outdir":   "",        # dossier de sortie (vide = répertoire courant)
 }
 
 # ── ASCII Banner ──────────────────────────────────────────────────────────────
@@ -133,6 +134,41 @@ def pause():
         pass
 
 
+def ask_outpaths(dout_default=None, iout_default=None):
+    """Demande dossier + noms fichiers. Retourne (dout, iout) ou (None, None) si retour."""
+    import os
+    dout_default = dout_default or CFG["dout"]
+    iout_default = iout_default or CFG["iout"]
+
+    print(f"\n  {DIM}Dossier de sortie : tape un chemin ou appuie sur Entrée pour utiliser{RST}")
+    print(f"  {DIM}le répertoire courant. Tape {W}b{DIM} pour annuler.{RST}")
+    outdir = ask("Dossier de sortie", CFG["outdir"] or "(courant)")
+    if outdir is None:
+        return None, None
+    if outdir in ("(courant)", ".", "./"):
+        outdir = ""
+
+    dout_name = ask("Nom fichier domaines", dout_default)
+    if dout_name is None:
+        return None, None
+
+    iout_name = ask("Nom fichier IPs/CIDRs", iout_default)
+    if iout_name is None:
+        return None, None
+
+    dout = resolve_path(outdir, dout_name)
+    iout = resolve_path(outdir, iout_name)
+    return dout, iout
+
+
+def parse_exts(raw: str) -> list:
+    """Retourne [] si toutes extensions, sinon liste normalisée."""
+    raw = raw.strip()
+    if raw in ("*", "all", "ALL", "tout", "toutes", ""):
+        return []
+    return [e.strip().lstrip(".").lower() for e in raw.split(",") if e.strip()]
+
+
 # ── Menus ─────────────────────────────────────────────────────────────────────
 
 MAIN_MENU = f"""
@@ -151,14 +187,16 @@ MAIN_MENU = f"""
 
 def show_cfg():
     sep()
+    outdir_label = CFG['outdir'] or f"{DIM}(répertoire courant){RST}"
     print(f"  {BOLD}{W}Paramètres actuels :{RST}\n")
     print(f"   {C}workers{RST}  = {W}{CFG['workers']}{RST}   {DIM}(threads parallèles){RST}")
     print(f"   {C}timeout{RST}  = {W}{CFG['timeout']}s{RST}")
-    print(f"   {C}exts{RST}     = {W}{CFG['exts']}{RST}")
+    print(f"   {C}exts{RST}     = {W}{CFG['exts']}{RST}   {DIM}(* = toutes){RST}")
     print(f"   {C}limit{RST}    = {W}{CFG['limit'] or 'aucun'}{RST}")
     print(f"   {C}depth{RST}    = {W}{CFG['depth']}{RST}")
-    print(f"   {C}dout{RST}     = {W}{CFG['dout']}{RST}")
-    print(f"   {C}iout{RST}     = {W}{CFG['iout']}{RST}")
+    print(f"   {C}outdir{RST}   = {W}{outdir_label}")
+    print(f"   {C}dout{RST}     = {W}{CFG['dout']}{RST}   {DIM}(nom du fichier domaines){RST}")
+    print(f"   {C}iout{RST}     = {W}{CFG['iout']}{RST}   {DIM}(nom du fichier IPs){RST}")
     sep()
 
 
@@ -168,8 +206,9 @@ def menu_params():
         print(f"  {BOLD}{W}Que modifier ?{RST}\n")
         print(f"   {G}[1]{RST} Workers (threads)   {G}[2]{RST} Timeout")
         print(f"   {G}[3]{RST} Extensions          {G}[4]{RST} Limite fichiers")
-        print(f"   {G}[5]{RST} Profondeur liens    {G}[6]{RST} Fichier domaines")
-        print(f"   {G}[7]{RST} Fichier IPs         {R}[0]{RST} Retour\n")
+        print(f"   {G}[5]{RST} Profondeur liens    {G}[6]{RST} Dossier de sortie")
+        print(f"   {G}[7]{RST} Fichier domaines    {G}[8]{RST} Fichier IPs")
+        print(f"   {R}[0]{RST} Retour\n")
 
         ch = ask("Choix", "0")
         if ch is None or ch == "0":
@@ -192,10 +231,13 @@ def menu_params():
                 except ValueError:
                     err("Valeur invalide")
         elif ch == "3":
-            v = ask("Extensions (ex: txt,gz)", CFG["exts"])
+            print(f"   {DIM}Tape les extensions séparées par virgule.{RST}")
+            print(f"   {DIM}Tape {W}*{DIM} ou {W}all{DIM} pour accepter TOUTES les extensions.{RST}")
+            v = ask("Extensions (ex: txt,gz  ou  *)", CFG["exts"])
             if v:
                 CFG["exts"] = v
-                ok(f"Extensions → {CFG['exts']}")
+                label = "TOUTES" if v in ("*", "all") else v
+                ok(f"Extensions → {label}")
         elif ch == "4":
             v = ask("Limite (0 = aucune)", str(CFG["limit"]))
             if v is not None:
@@ -213,12 +255,18 @@ def menu_params():
                 except ValueError:
                     err("Valeur invalide")
         elif ch == "6":
-            v = ask("Fichier domaines", CFG["dout"])
+            print(f"   {DIM}Chemin absolu ou relatif. Ex: /home/user/results  ou  ./output{RST}")
+            v = ask("Dossier de sortie", CFG["outdir"] or "(courant)")
+            if v and v != "(courant)":
+                CFG["outdir"] = "" if v in (".", "./", "(courant)") else v
+                ok(f"outdir → {CFG['outdir'] or '(répertoire courant)'}")
+        elif ch == "7":
+            v = ask("Nom fichier domaines", CFG["dout"])
             if v:
                 CFG["dout"] = v
                 ok(f"dout → {CFG['dout']}")
-        elif ch == "7":
-            v = ask("Fichier IPs", CFG["iout"])
+        elif ch == "8":
+            v = ask("Nom fichier IPs", CFG["iout"])
             if v:
                 CFG["iout"] = v
                 ok(f"iout → {CFG['iout']}")
@@ -256,9 +304,11 @@ def mode_index():
     url = ask("URL de l'index")
     if url is None: return
 
+    print(f"  {DIM}Extensions : tape {W}*{DIM} ou {W}all{DIM} pour toutes, ou ex: {W}txt,gz,csv{RST}")
     exts_str = ask("Extensions", CFG["exts"])
     if exts_str is None: return
-    exts = [e.strip().lstrip(".").lower() for e in exts_str.split(",")]
+    exts = parse_exts(exts_str)
+    exts_label = col(Y, "TOUTES") if not exts else col(W, ",".join(exts))
 
     wrk_str = ask("Workers (threads parallèles)", str(CFG["workers"]))
     if wrk_str is None: return
@@ -270,12 +320,13 @@ def mode_index():
     try: limit = max(0, int(lim_str))
     except ValueError: limit = CFG["limit"]
 
-    dout = ask("Fichier domaines", CFG["dout"])
+    dout, iout = ask_outpaths()
     if dout is None: return
-    iout = ask("Fichier IPs", CFG["iout"])
-    if iout is None: return
 
     sep()
+    info(f"Extensions : {exts_label}")
+    info(f"Workers    : {col(W, str(workers))}")
+    info(f"Sortie     : {col(C, dout)} / {col(C, iout)}")
     info(f"Connexion à l'index…")
 
     _done_total = [0, 0]
@@ -328,12 +379,11 @@ def mode_url():
     try: workers = max(1, min(50, int(wrk_str)))
     except ValueError: workers = CFG["workers"]
 
-    dout = ask("Fichier domaines", CFG["dout"])
+    dout, iout = ask_outpaths()
     if dout is None: return
-    iout = ask("Fichier IPs", CFG["iout"])
-    if iout is None: return
 
     sep()
+    info(f"Workers : {col(W, str(workers))}  |  Sortie : {col(C, dout)} / {col(C, iout)}")
     with Spinner(f"Scraping {url[:50]}…"):
         results = scrape_url(url, follow=follow, depth=depth, workers=workers)
     print()
@@ -354,7 +404,7 @@ def mode_bgp():
     asn = ask("Numéro ASN (ex: 15169)")
     if asn is None: return
 
-    dout = ask("Fichier IPs/CIDRs", CFG["iout"])
+    dout, iout = ask_outpaths()
     if dout is None: return
 
     sep()
@@ -366,7 +416,7 @@ def mode_bgp():
         err("Aucun résultat.")
         return
 
-    show_results(results, CFG["dout"], dout)
+    show_results(results, dout, iout)
 
 
 # ── Mode 4 : RIPE ────────────────────────────────────────────────────────────
@@ -378,7 +428,7 @@ def mode_ripe():
     query = ask("Recherche (org / IP / réseau)")
     if query is None: return
 
-    dout = ask("Fichier IPs/CIDRs", CFG["iout"])
+    dout, iout = ask_outpaths()
     if dout is None: return
 
     sep()
@@ -390,7 +440,7 @@ def mode_ripe():
         err("Aucun résultat.")
         return
 
-    show_results(results, CFG["dout"], dout)
+    show_results(results, dout, iout)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

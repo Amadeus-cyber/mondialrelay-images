@@ -17,7 +17,7 @@ try:
                                MessageHandler, CallbackQueryHandler,
                                ConversationHandler, ContextTypes, filters)
     from core import (scrape_index, scrape_url, scrape_bgp, scrape_ripe,
-                      extract, build_lists)
+                      extract, build_lists, resolve_path)
 except ImportError:
     print("Deps manquants. Lance : pip install python-telegram-bot requests beautifulsoup4")
     raise
@@ -132,7 +132,7 @@ async def callback_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "index":
         await query.message.reply_text(
-            "🗂 *Index Apache*\n\nEnvoie l\\`URL de l'index \\(ex: https://example.com/lists/\\)\\.\n\n"
+            "🗂 *Index Apache*\n\nEnvoie l'URL de l'index \\(ex: `https://example\\.com/lists/`\\)\\.\n\n"
             "Tape /annuler pour revenir\\.",
             parse_mode="MarkdownV2"
         )
@@ -178,14 +178,18 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def index_get_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["index_url"] = update.message.text.strip()
     await update.message.reply_text(
-        "📂 Extensions à télécharger ?\n\nDéfaut : `txt,gz`",
+        "📂 *Extensions à télécharger ?*\n\n"
+        "• `txt,gz` — uniquement ces extensions\n"
+        "• `*` — *toutes* les extensions\n\n"
+        "Défaut : `txt,gz`",
         parse_mode="Markdown"
     )
     return STATE_INDEX_EXT
 
 
 async def index_get_ext(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["index_ext"] = update.message.text.strip() or "txt,gz"
+    raw = update.message.text.strip()
+    context.user_data["index_ext"] = raw if raw else "txt,gz"
     await update.message.reply_text(
         "⚡ Combien de *workers* \\(threads\\) ? \\(1\\-20\\)\n\nDéfaut : `5`",
         parse_mode="MarkdownV2"
@@ -211,9 +215,11 @@ async def index_get_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         context.user_data["index_limit"] = 0
 
-    url     = context.user_data["index_url"]
-    exts    = [e.strip().lstrip(".").lower()
-               for e in context.user_data["index_ext"].split(",")]
+    url  = context.user_data["index_url"]
+    raw  = context.user_data["index_ext"]
+    exts = [] if raw.strip() in ("*", "all", "tout", "toutes") else [
+        e.strip().lstrip(".").lower() for e in raw.split(",") if e.strip()
+    ]
     workers = context.user_data["index_workers"]
     limit   = context.user_data["index_limit"]
 
