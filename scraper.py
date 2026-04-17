@@ -4,7 +4,22 @@
 import os
 import sys
 import time
+import subprocess
 import threading
+from pathlib import Path
+
+# ── Chargement du .env ────────────────────────────────────────────────────────
+_env_path = Path(__file__).parent / ".env"
+
+def _load_env():
+    if _env_path.exists():
+        for line in _env_path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+
+_load_env()
 
 try:
     from core import (scrape_index, scrape_url, scrape_bgp, scrape_ripe,
@@ -42,7 +57,8 @@ CFG = {
     "dout":     "domains.txt",
     "iout":     "ips.txt",
     "depth":    2,
-    "outdir":   "",        # dossier de sortie (vide = répertoire courant)
+    "outdir":   "",
+    "bot_token": os.environ.get("BOT_TOKEN", ""),
 }
 
 # ── ASCII Banner ──────────────────────────────────────────────────────────────
@@ -134,6 +150,23 @@ def pause():
         pass
 
 
+def _save_token(token: str):
+    """Écrit / met à jour BOT_TOKEN dans le fichier .env."""
+    lines = []
+    found = False
+    if _env_path.exists():
+        for line in _env_path.read_text().splitlines():
+            if line.startswith("BOT_TOKEN="):
+                lines.append(f"BOT_TOKEN={token}")
+                found = True
+            else:
+                lines.append(line)
+    if not found:
+        lines.append(f"BOT_TOKEN={token}")
+    _env_path.write_text("\n".join(lines) + "\n")
+    os.environ["BOT_TOKEN"] = token
+
+
 def ask_outpaths(dout_default=None, iout_default=None):
     """Demande dossier + noms fichiers. Retourne (dout, iout) ou (None, None) si retour."""
     import os
@@ -180,6 +213,7 @@ MAIN_MENU = f"""
   ║  {G}[3]{W}  Source BGP      {DIM}(ASN → CIDRs){W}       ║
   ║  {G}[4]{W}  Source RIPE     {DIM}(org → CIDRs){W}       ║
   ║  {Y}[5]{W}  Paramètres      {DIM}(config défaut){W}      ║
+  ║  {M}[6]{W}  Lancer le Bot   {DIM}(Telegram){W}          ║
   ║  {R}[0]{W}  Quitter                              ║
   ╚══════════════════════════════════════════╝{RST}
 """
@@ -188,15 +222,18 @@ MAIN_MENU = f"""
 def show_cfg():
     sep()
     outdir_label = CFG['outdir'] or f"{DIM}(répertoire courant){RST}"
+    tok = CFG["bot_token"]
+    tok_label = (f"{tok[:8]}…{tok[-4:]}" if len(tok) > 16 else tok) if tok else f"{R}non configuré{RST}"
     print(f"  {BOLD}{W}Paramètres actuels :{RST}\n")
-    print(f"   {C}workers{RST}  = {W}{CFG['workers']}{RST}   {DIM}(threads parallèles){RST}")
-    print(f"   {C}timeout{RST}  = {W}{CFG['timeout']}s{RST}")
-    print(f"   {C}exts{RST}     = {W}{CFG['exts']}{RST}   {DIM}(* = toutes){RST}")
-    print(f"   {C}limit{RST}    = {W}{CFG['limit'] or 'aucun'}{RST}")
-    print(f"   {C}depth{RST}    = {W}{CFG['depth']}{RST}")
-    print(f"   {C}outdir{RST}   = {W}{outdir_label}")
-    print(f"   {C}dout{RST}     = {W}{CFG['dout']}{RST}   {DIM}(nom du fichier domaines){RST}")
-    print(f"   {C}iout{RST}     = {W}{CFG['iout']}{RST}   {DIM}(nom du fichier IPs){RST}")
+    print(f"   {C}workers{RST}    = {W}{CFG['workers']}{RST}   {DIM}(threads parallèles){RST}")
+    print(f"   {C}timeout{RST}    = {W}{CFG['timeout']}s{RST}")
+    print(f"   {C}exts{RST}       = {W}{CFG['exts']}{RST}   {DIM}(* = toutes){RST}")
+    print(f"   {C}limit{RST}      = {W}{CFG['limit'] or 'aucun'}{RST}")
+    print(f"   {C}depth{RST}      = {W}{CFG['depth']}{RST}")
+    print(f"   {C}outdir{RST}     = {W}{outdir_label}")
+    print(f"   {C}dout{RST}       = {W}{CFG['dout']}{RST}   {DIM}(nom fichier domaines){RST}")
+    print(f"   {C}iout{RST}       = {W}{CFG['iout']}{RST}   {DIM}(nom fichier IPs){RST}")
+    print(f"   {C}bot_token{RST}  = {W}{tok_label}")
     sep()
 
 
@@ -208,7 +245,7 @@ def menu_params():
         print(f"   {G}[3]{RST} Extensions          {G}[4]{RST} Limite fichiers")
         print(f"   {G}[5]{RST} Profondeur liens    {G}[6]{RST} Dossier de sortie")
         print(f"   {G}[7]{RST} Fichier domaines    {G}[8]{RST} Fichier IPs")
-        print(f"   {R}[0]{RST} Retour\n")
+        print(f"   {M}[9]{RST} Token bot Telegram  {R}[0]{RST} Retour\n")
 
         ch = ask("Choix", "0")
         if ch is None or ch == "0":
@@ -270,6 +307,13 @@ def menu_params():
             if v:
                 CFG["iout"] = v
                 ok(f"iout → {CFG['iout']}")
+        elif ch == "9":
+            print(f"   {DIM}Obtiens ton token via @BotFather sur Telegram.{RST}")
+            v = ask("Token bot Telegram")
+            if v:
+                _save_token(v)
+                CFG["bot_token"] = v
+                ok(f"Token sauvegardé dans .env")
         time.sleep(0.3)
 
 
@@ -447,6 +491,50 @@ def mode_ripe():
 
 MODES = {"1": mode_index, "2": mode_url, "3": mode_bgp, "4": mode_ripe}
 
+
+def mode_bot():
+    sep()
+    print(f"  {BOLD}{M}── Bot Telegram ──────────────────────────{RST}\n")
+
+    token = CFG.get("bot_token", "")
+
+    if not token:
+        warn("Aucun token configuré.")
+        print(f"  {DIM}Obtiens ton token via @BotFather sur Telegram.{RST}\n")
+        v = ask("Colle ton token API Telegram")
+        if not v:
+            return
+        _save_token(v)
+        CFG["bot_token"] = v
+        token = v
+        ok(f"Token sauvegardé dans .env")
+    else:
+        short = f"{token[:8]}…{token[-4:]}"
+        info(f"Token : {col(W, short)}")
+        ch = ask("Utiliser ce token ? (o) ou en saisir un nouveau (n)", "o")
+        if ch is None:
+            return
+        if ch.lower() == "n":
+            v = ask("Nouveau token")
+            if not v:
+                return
+            _save_token(v)
+            CFG["bot_token"] = v
+            token = v
+            ok("Token mis à jour.")
+
+    sep()
+    info(f"Démarrage du bot…  {DIM}(Ctrl+C pour arrêter){RST}")
+    bot_py = Path(__file__).parent / "bot.py"
+
+    try:
+        subprocess.run([sys.executable, str(bot_py)], check=False)
+    except KeyboardInterrupt:
+        pass
+    print()
+    ok("Bot arrêté.")
+
+
 def main():
     print_banner(animate=True)
 
@@ -465,6 +553,11 @@ def main():
             menu_params()
             print_banner(animate=False)
             continue
+        elif choice == "6":
+            print_banner(animate=False)
+            mode_bot()
+            pause()
+            print_banner(animate=False)
         elif choice in MODES:
             print_banner(animate=False)
             MODES[choice]()

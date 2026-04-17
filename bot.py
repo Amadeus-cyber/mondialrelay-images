@@ -1,366 +1,540 @@
 #!/usr/bin/env python3
 """
 ZeuScraper — Bot Telegram
-Commandes : /start  /index  /url  /bgp  /ripe  /help
-Le bot peut aussi recevoir un fichier .txt directement.
+Lit le token depuis .env (BOT_TOKEN=...) ou variable d'environnement.
 """
 
 import os
 import logging
 import tempfile
 from io import BytesIO
+from pathlib import Path
+
+# Charge .env si présent
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    for line in _env_path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 try:
-    from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
-                          ReplyKeyboardMarkup, ReplyKeyboardRemove)
-    from telegram.ext import (ApplicationBuilder, CommandHandler,
-                               MessageHandler, CallbackQueryHandler,
-                               ConversationHandler, ContextTypes, filters)
-    from core import (scrape_index, scrape_url, scrape_bgp, scrape_ripe,
-                      extract, build_lists, resolve_path)
+    from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup, Message)
+    from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler,
+                               CallbackQueryHandler, ConversationHandler,
+                               ContextTypes, filters)
+    from telegram.error import BadRequest
+    from core import scrape_index, scrape_url, scrape_bgp, scrape_ripe, extract, build_lists
 except ImportError:
-    print("Deps manquants. Lance : pip install python-telegram-bot requests beautifulsoup4")
+    print("Deps manquants : pip install python-telegram-bot requests beautifulsoup4")
     raise
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Token — mets le tien ici ou via variable d'environnement BOT_TOKEN ────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "METS_TON_TOKEN_ICI")
+# ── États ─────────────────────────────────────────────────────────────────────
 
-# ── États de conversation ──────────────────────────────────────────────────────
 (
-    STATE_MENU,
-    STATE_INDEX_URL, STATE_INDEX_EXT, STATE_INDEX_WORKERS, STATE_INDEX_LIMIT,
-    STATE_URL_URL,   STATE_URL_FOLLOW, STATE_URL_WORKERS,
-    STATE_BGP_ASN,
-    STATE_RIPE_QUERY,
-) = range(10)
+    ST_MENU,
+    ST_IDX_URL, ST_IDX_EXT, ST_IDX_WORKERS, ST_IDX_LIMIT,
+    ST_URL_TARGET, ST_URL_WORKERS,
+    ST_BGP_ASN,
+    ST_RIPE_QUERY,
+) = range(9)
 
-# ── Keyboard principal ────────────────────────────────────────────────────────
+# ── Clavier principal ─────────────────────────────────────────────────────────
 
-MAIN_KB = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🗂  Index Apache",  callback_data="index"),
-     InlineKeyboardButton("🔗  URL directe",   callback_data="url")],
-    [InlineKeyboardButton("🌐  BGP (ASN)",     callback_data="bgp"),
-     InlineKeyboardButton("📡  RIPE",          callback_data="ripe")],
-    [InlineKeyboardButton("ℹ️  Aide",          callback_data="help")],
+KB_MAIN = InlineKeyboardMarkup([
+    [
+        InlineKeyboardButton("🗂  Index Apache",  callback_data="m:index"),
+        InlineKeyboardButton("🔗  URL directe",   callback_data="m:url"),
+    ],
+    [
+        InlineKeyboardButton("🌐  BGP / ASN",     callback_data="m:bgp"),
+        InlineKeyboardButton("📡  RIPE NCC",      callback_data="m:ripe"),
+    ],
+    [InlineKeyboardButton("ℹ️  Aide",            callback_data="m:help")],
 ])
 
-BANNER = (
+KB_CANCEL = InlineKeyboardMarkup([[
+    InlineKeyboardButton("❌ Annuler", callback_data="m:cancel"),
+]])
+
+KB_EXT = InlineKeyboardMarkup([
+    [
+        InlineKeyboardButton("📄 txt",    callback_data="ext:txt"),
+        InlineKeyboardButton("📦 gz",     callback_data="ext:gz"),
+        InlineKeyboardButton("📋 csv",    callback_data="ext:csv"),
+    ],
+    [
+        InlineKeyboardButton("🗂 txt + gz",        callback_data="ext:txt,gz"),
+        InlineKeyboardButton("✅ TOUTES (*)",       callback_data="ext:*"),
+    ],
+    [InlineKeyboardButton("❌ Annuler",             callback_data="m:cancel")],
+])
+
+BANNER_TEXT = (
     "⚡ *ZeuScraper v3.0*\n"
-    "━━━━━━━━━━━━━━━━━━━━━\n"
-    "Domain \\& IP Range Scraper\n\n"
-    "Choisis un mode ou envoie directement un fichier \\`.txt\\` "
-    "pour extraire les domaines et IPs\\."
+    "━━━━━━━━━━━━━━━━━━━\n"
+    "Domain & IP Range Scraper\n\n"
+    "Choisis un mode ci\\-dessous, ou envoie directement "
+    "un fichier `.txt` pour extraire domaines et IPs automatiquement\\."
 )
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+HELP_TEXT = (
+    "📖 *ZeuScraper — Aide*\n\n"
+    "*Modes disponibles :*\n"
+    "🗂 *Index Apache* — Scrape tous les fichiers d'un répertoire web\n"
+    "🔗 *URL directe* — Scrape une page ou un fichier précis\n"
+    "🌐 *BGP/ASN* — Plages IP d'un ASN via BGP\\.HE\\.NET\n"
+    "📡 *RIPE NCC* — Plages IP via l'API RIPE\n\n"
+    "*Fichier direct :*\n"
+    "Envoie n'importe quel fichier `.txt` → extraction immédiate\n\n"
+    "*Commandes :*\n"
+    "`/start` `/help` `/annuler`"
+)
 
-async def send_lists(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                     results: dict, source_label: str):
-    domains, all_ips = build_lists(results)
+# ── Helpers messages ──────────────────────────────────────────────────────────
 
-    msg = (
-        f"✅ *Scraping terminé* — _{source_label}_\n\n"
-        f"📄 Domaines  : `{len(domains)}`\n"
-        f"🌐 IPs/CIDRs : `{len(all_ips)}`"
+async def delete_msg(bot, chat_id: int, msg_id: int):
+    """Supprime silencieusement un message (ignore les erreurs si déjà supprimé)."""
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+    except BadRequest:
+        pass
+
+
+async def replace(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                  text: str, keyboard=None, parse_mode="MarkdownV2") -> Message:
+    """
+    Envoie un nouveau message ET supprime le précédent bot-message stocké.
+    Stocke l'ID du nouveau message pour le prochain replace().
+    """
+    chat_id  = update.effective_chat.id
+    prev_ids = context.user_data.get("bot_msgs", [])
+
+    # Envoie d'abord le nouveau message
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode=parse_mode,
     )
-    await update.effective_message.reply_text(msg, parse_mode="MarkdownV2")
 
-    if domains:
-        buf = BytesIO("\n".join(domains).encode())
-        buf.name = "domains.txt"
-        await update.effective_message.reply_document(buf, filename="domains.txt",
-                                                       caption="📄 Liste des domaines")
+    # Supprime les anciens messages bot
+    for mid in prev_ids:
+        await delete_msg(context.bot, chat_id, mid)
 
-    if all_ips:
-        buf = BytesIO("\n".join(all_ips).encode())
-        buf.name = "ips.txt"
-        await update.effective_message.reply_document(buf, filename="ips.txt",
-                                                       caption="🌐 Liste des IPs / CIDRs")
+    # Essaie aussi de supprimer le message utilisateur déclencheur
+    trigger = update.message or (update.callback_query and update.callback_query.message)
+    if update.message:
+        await delete_msg(context.bot, chat_id, update.message.message_id)
 
-    return await show_main_menu(update, context)
+    context.user_data["bot_msgs"] = [msg.message_id]
+    return msg
 
 
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "🏠 *Menu principal* — Choisis un mode :"
-    msg  = update.effective_message
-    if msg:
-        await msg.reply_text(text, reply_markup=MAIN_KB, parse_mode="Markdown")
-    return STATE_MENU
+async def replace_doc(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                      buf: BytesIO, filename: str, caption: str) -> Message:
+    """Envoie un document en supprimant les anciens messages."""
+    chat_id  = update.effective_chat.id
+    prev_ids = context.user_data.get("bot_msgs", [])
+
+    msg = await context.bot.send_document(
+        chat_id=chat_id,
+        document=buf,
+        filename=filename,
+        caption=caption,
+    )
+    for mid in prev_ids:
+        await delete_msg(context.bot, chat_id, mid)
+
+    if update.message:
+        await delete_msg(context.bot, chat_id, update.message.message_id)
+
+    context.user_data["bot_msgs"] = [msg.message_id]
+    return msg
 
 
-async def typing_action(context, chat_id):
+async def typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
 
-# ── /start ────────────────────────────────────────────────────────────────────
+# ── Menus ─────────────────────────────────────────────────────────────────────
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(BANNER, parse_mode="MarkdownV2")
-    return await show_main_menu(update, context)
-
-
-# ── /help ─────────────────────────────────────────────────────────────────────
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "📖 *ZeuScraper — Aide*\n\n"
-        "*Commandes :*\n"
-        "  `/start`  — Menu principal\n"
-        "  `/index`  — Index Apache \\(répertoire\\)\n"
-        "  `/url`    — URL directe\n"
-        "  `/bgp`    — Plages IP depuis ASN\n"
-        "  `/ripe`   — Plages IP RIPE NCC\n"
-        "  `/help`   — Cette aide\n\n"
-        "*Envoie un fichier :*\n"
-        "  Envoie n'importe quel fichier \\`.txt\\` et le bot "
-        "extraira automatiquement les domaines et IPs qu'il contient\\."
-    )
-    await update.message.reply_text(text, parse_mode="MarkdownV2")
-    return STATE_MENU
+async def show_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("step_data", None)
+    await replace(update, context, BANNER_TEXT, KB_MAIN)
+    return ST_MENU
 
 
-# ── Callback inline keyboard ──────────────────────────────────────────────────
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await show_main(update, context)
 
-async def callback_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data  = query.data
 
-    if data == "index":
-        await query.message.reply_text(
-            "🗂 *Index Apache*\n\nEnvoie l'URL de l'index \\(ex: `https://example\\.com/lists/`\\)\\.\n\n"
-            "Tape /annuler pour revenir\\.",
-            parse_mode="MarkdownV2"
-        )
-        return STATE_INDEX_URL
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await replace(update, context, HELP_TEXT,
+                  InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="m:home")]]))
+    return ST_MENU
 
-    elif data == "url":
-        await query.message.reply_text(
-            "🔗 *URL directe*\n\nEnvoie l'URL à scraper\\.\n\nTape /annuler pour revenir\\.",
-            parse_mode="MarkdownV2"
-        )
-        return STATE_URL_URL
 
-    elif data == "bgp":
-        await query.message.reply_text(
-            "🌐 *BGP — Numéro ASN*\n\nEx: `15169` ou `AS15169`\\.\n\nTape /annuler pour revenir\\.",
-            parse_mode="MarkdownV2"
-        )
-        return STATE_BGP_ASN
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    return await show_main(update, context)
 
-    elif data == "ripe":
-        await query.message.reply_text(
-            "📡 *RIPE NCC*\n\nEntre ton terme de recherche \\(org, IP, réseau\\)\\.\n\nTape /annuler pour revenir\\.",
-            parse_mode="MarkdownV2"
-        )
-        return STATE_RIPE_QUERY
 
-    elif data == "help":
+# ── Callback inline ───────────────────────────────────────────────────────────
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q    = update.callback_query
+    await q.answer()
+    data = q.data
+
+    if data == "m:home" or data == "m:cancel":
+        context.user_data.pop("step_data", None)
+        return await show_main(update, context)
+
+    if data == "m:help":
         return await cmd_help(update, context)
 
-    return STATE_MENU
+    # ── Choix de mode ──
+    if data == "m:index":
+        await replace(update, context,
+                      "🗂 *Index Apache*\n\n"
+                      "Envoie l'URL du répertoire à scraper\\.\n"
+                      "_ex: https://example\\.com/lists/_",
+                      KB_CANCEL)
+        context.user_data["step_data"] = {"mode": "index"}
+        return ST_IDX_URL
 
+    if data == "m:url":
+        await replace(update, context,
+                      "🔗 *URL directe*\n\nEnvoie l'URL de la page ou du fichier\\.",
+                      KB_CANCEL)
+        context.user_data["step_data"] = {"mode": "url"}
+        return ST_URL_TARGET
 
-# ── /annuler ──────────────────────────────────────────────────────────────────
+    if data == "m:bgp":
+        await replace(update, context,
+                      "🌐 *BGP / ASN*\n\nEnvoie le numéro ASN\\.\n_ex: `15169` ou `AS15169`_",
+                      KB_CANCEL)
+        context.user_data["step_data"] = {"mode": "bgp"}
+        return ST_BGP_ASN
 
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("↩️ Annulé.")
-    return await show_main_menu(update, context)
+    if data == "m:ripe":
+        await replace(update, context,
+                      "📡 *RIPE NCC*\n\nEnvoie ton terme de recherche \\(org, IP, réseau\\)\\.",
+                      KB_CANCEL)
+        context.user_data["step_data"] = {"mode": "ripe"}
+        return ST_RIPE_QUERY
+
+    # ── Choix d'extension via boutons ──
+    if data.startswith("ext:"):
+        val = data[4:]
+        sd  = context.user_data.setdefault("step_data", {})
+        sd["ext"] = val
+        label = "TOUTES les extensions" if val == "*" else f"`.{val}`"
+        await replace(update, context,
+                      f"✅ Extensions : *{label}*\n\n"
+                      "⚡ Combien de *workers* \\(threads parallèles\\) ?\n\n"
+                      "_Entre un nombre entre 1 et 20, ou tape `5` pour le défaut\\._",
+                      KB_CANCEL)
+        return ST_IDX_WORKERS
+
+    return ST_MENU
 
 
 # ── Flux Index Apache ─────────────────────────────────────────────────────────
 
-async def index_get_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["index_url"] = update.message.text.strip()
-    await update.message.reply_text(
-        "📂 *Extensions à télécharger ?*\n\n"
-        "• `txt,gz` — uniquement ces extensions\n"
-        "• `*` — *toutes* les extensions\n\n"
-        "Défaut : `txt,gz`",
-        parse_mode="Markdown"
-    )
-    return STATE_INDEX_EXT
+async def idx_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    url = update.message.text.strip()
+    context.user_data.setdefault("step_data", {})["url"] = url
+    await replace(update, context,
+                  "📂 *Quelles extensions télécharger ?*\n\n"
+                  "Choisis ci\\-dessous ou tape manuellement \\(ex: `txt,gz,csv`\\)\\.",
+                  KB_EXT)
+    return ST_IDX_EXT
 
 
-async def index_get_ext(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def idx_ext_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Reçoit l'extension tapée manuellement."""
     raw = update.message.text.strip()
-    context.user_data["index_ext"] = raw if raw else "txt,gz"
-    await update.message.reply_text(
-        "⚡ Combien de *workers* \\(threads\\) ? \\(1\\-20\\)\n\nDéfaut : `5`",
-        parse_mode="MarkdownV2"
-    )
-    return STATE_INDEX_WORKERS
+    context.user_data.setdefault("step_data", {})["ext"] = raw
+    label = "TOUTES" if raw in ("*", "all", "toutes") else f"`{raw}`"
+    await replace(update, context,
+                  f"✅ Extensions : *{label}*\n\n"
+                  "⚡ Combien de *workers* \\(threads\\) ?\n_Défaut : `5`_",
+                  KB_CANCEL)
+    return ST_IDX_WORKERS
 
 
-async def index_get_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def idx_workers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["index_workers"] = max(1, min(20, int(update.message.text.strip())))
+        w = max(1, min(20, int(update.message.text.strip())))
     except ValueError:
-        context.user_data["index_workers"] = 5
-    await update.message.reply_text(
-        "🔢 Limite de fichiers ? \\(`0` = tous\\)\n\nDéfaut : `0`",
-        parse_mode="MarkdownV2"
-    )
-    return STATE_INDEX_LIMIT
+        w = 5
+    context.user_data["step_data"]["workers"] = w
+    await replace(update, context,
+                  "🔢 *Limite de fichiers ?*\n\n"
+                  "Entre un nombre \\(ex: `50`\\) ou `0` pour *tous*\\.",
+                  KB_CANCEL)
+    return ST_IDX_LIMIT
 
 
-async def index_get_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def idx_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["index_limit"] = max(0, int(update.message.text.strip()))
+        limit = max(0, int(update.message.text.strip()))
     except ValueError:
-        context.user_data["index_limit"] = 0
+        limit = 0
 
-    url  = context.user_data["index_url"]
-    raw  = context.user_data["index_ext"]
-    exts = [] if raw.strip() in ("*", "all", "tout", "toutes") else [
-        e.strip().lstrip(".").lower() for e in raw.split(",") if e.strip()
+    sd      = context.user_data["step_data"]
+    url     = sd["url"]
+    raw_ext = sd.get("ext", "txt,gz")
+    exts    = [] if raw_ext.strip() in ("*", "all", "toutes", "tout") else [
+        e.strip().lstrip(".").lower() for e in raw_ext.split(",") if e.strip()
     ]
-    workers = context.user_data["index_workers"]
-    limit   = context.user_data["index_limit"]
+    workers = sd.get("workers", 5)
+    ext_lbl = "toutes" if not exts else ",".join(exts)
 
-    await update.message.reply_text(
-        f"⏳ Scraping en cours…\n`{url}`",
-        parse_mode="Markdown"
-    )
-    await typing_action(context, update.effective_chat.id)
+    await replace(update, context,
+                  f"⏳ *Scraping en cours…*\n\n"
+                  f"🔗 `{url}`\n"
+                  f"📂 Extensions : `{ext_lbl}`\n"
+                  f"⚡ Workers : `{workers}`\n"
+                  f"🔢 Limite : `{limit or 'aucune'}`\n\n"
+                  "_Patiente, ça peut prendre du temps\\.\\.\\._")
+
+    await typing(context, update.effective_chat.id)
 
     results, total = await context.application.loop.run_in_executor(
         None, lambda: scrape_index(url, exts, limit, workers)
     )
-
-    context.user_data.clear()
-    return await send_lists(update, context, results,
-                            f"Index Apache · {total} fichiers")
+    context.user_data.pop("step_data", None)
+    return await send_results(update, context, results, f"Index Apache · {total} fichiers")
 
 
 # ── Flux URL directe ──────────────────────────────────────────────────────────
 
-async def url_get_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["target_url"] = update.message.text.strip()
-    await update.message.reply_text(
-        "⚡ Combien de *workers* \\(threads\\) ?\n\nDéfaut : `3`",
-        parse_mode="MarkdownV2"
-    )
-    return STATE_URL_WORKERS
+async def url_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    url = update.message.text.strip()
+    context.user_data["step_data"]["url"] = url
+    await replace(update, context,
+                  "⚡ *Combien de workers \\(threads\\) ?*\n\n_Défaut : `3`_",
+                  KB_CANCEL)
+    return ST_URL_WORKERS
 
 
-async def url_get_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def url_workers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["url_workers"] = max(1, min(20, int(update.message.text.strip())))
+        w = max(1, min(20, int(update.message.text.strip())))
     except ValueError:
-        context.user_data["url_workers"] = 3
+        w = 3
 
-    url     = context.user_data["target_url"]
-    workers = context.user_data["url_workers"]
+    url = context.user_data["step_data"]["url"]
 
-    await update.message.reply_text(f"⏳ Scraping…\n`{url}`", parse_mode="Markdown")
-    await typing_action(context, update.effective_chat.id)
+    await replace(update, context,
+                  f"⏳ *Scraping en cours…*\n\n🔗 `{url}`\n⚡ Workers : `{w}`\n\n"
+                  "_Patiente\\.\\.\\._")
+    await typing(context, update.effective_chat.id)
 
     results = await context.application.loop.run_in_executor(
-        None, lambda: scrape_url(url, follow=False, depth=1, workers=workers)
+        None, lambda: scrape_url(url, follow=False, depth=1, workers=w)
     )
-
-    context.user_data.clear()
-    return await send_lists(update, context, results, f"URL · {url[:50]}")
+    context.user_data.pop("step_data", None)
+    return await send_results(update, context, results, f"URL · {url[:40]}")
 
 
 # ── Flux BGP ──────────────────────────────────────────────────────────────────
 
-async def bgp_get_asn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    asn = update.message.text.strip()
-    await update.message.reply_text(f"⏳ Requête BGP AS{asn.upper().replace('AS','')}…")
-    await typing_action(context, update.effective_chat.id)
+async def bgp_asn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    asn = update.message.text.strip().upper().replace("AS", "")
+    await replace(update, context,
+                  f"⏳ *Requête BGP…*\n\nAS`{asn}`\n\n_Patiente\\.\\.\\._")
+    await typing(context, update.effective_chat.id)
 
     results = await context.application.loop.run_in_executor(
         None, lambda: scrape_bgp(asn)
     )
-    return await send_lists(update, context, results, f"BGP AS{asn}")
+    return await send_results(update, context, results, f"BGP AS{asn}")
 
 
 # ── Flux RIPE ─────────────────────────────────────────────────────────────────
 
-async def ripe_get_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ripe_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.message.text.strip()
-    await update.message.reply_text(f"⏳ Requête RIPE : {query}…")
-    await typing_action(context, update.effective_chat.id)
+    await replace(update, context,
+                  f"⏳ *Requête RIPE…*\n\n`{query}`\n\n_Patiente\\.\\.\\._")
+    await typing(context, update.effective_chat.id)
 
     results = await context.application.loop.run_in_executor(
         None, lambda: scrape_ripe(query)
     )
-    return await send_lists(update, context, results, f"RIPE · {query}")
+    return await send_results(update, context, results, f"RIPE · {query}")
 
 
-# ── Fichier reçu ──────────────────────────────────────────────────────────────
+# ── Fichier .txt reçu ─────────────────────────────────────────────────────────
 
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     doc = update.message.document
     if not doc:
-        return STATE_MENU
+        return ST_MENU
 
-    await update.message.reply_text("📥 Fichier reçu, extraction en cours…")
-    await typing_action(context, update.effective_chat.id)
+    await replace(update, context, "📥 *Fichier reçu…* extraction en cours\\.")
+    await typing(context, update.effective_chat.id)
 
-    file = await context.bot.get_file(doc.file_id)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp:
-        await file.download_to_drive(tmp.name)
-        content = open(tmp.name, "r", errors="replace").read()
-        os.unlink(tmp.name)
+    tg_file = await context.bot.get_file(doc.file_id)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as tmp:
+        await tg_file.download_to_drive(tmp.name)
+        try:
+            content = open(tmp.name, encoding="utf-8", errors="replace").read()
+        finally:
+            os.unlink(tmp.name)
 
     results = extract(content)
-    return await send_lists(update, context, results, f"Fichier : {doc.file_name}")
+    return await send_results(update, context, results, f"Fichier · {doc.file_name}")
 
 
-# ── Lancement du bot ──────────────────────────────────────────────────────────
+# ── Envoi des résultats ───────────────────────────────────────────────────────
+
+async def send_results(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                       results: dict, label: str) -> int:
+    domains, all_ips = build_lists(results)
+    chat_id = update.effective_chat.id
+
+    prev_ids = context.user_data.get("bot_msgs", [])
+    for mid in prev_ids:
+        await delete_msg(context.bot, chat_id, mid)
+    context.user_data["bot_msgs"] = []
+
+    if not domains and not all_ips:
+        await replace(update, context,
+                      "⚠️ *Aucun résultat trouvé\\.*\n\nVérifie l'URL ou essaie un autre mode\\.",
+                      InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="m:home")]]))
+        return ST_MENU
+
+    # ── Résumé ──
+    summary = (
+        f"✅ *Scraping terminé*\n"
+        f"_{label}_\n\n"
+        f"📄 Domaines  : `{len(domains)}`\n"
+        f"🌐 IPs/CIDRs : `{len(all_ips)}`"
+    )
+    sum_msg = await context.bot.send_message(
+        chat_id=chat_id, text=summary, parse_mode="MarkdownV2"
+    )
+    sent_ids = [sum_msg.message_id]
+
+    # ── Fichier domaines ──
+    if domains:
+        buf       = BytesIO("\n".join(domains).encode())
+        buf.name  = "domains.txt"
+        d_msg     = await context.bot.send_document(
+            chat_id=chat_id, document=buf,
+            filename="domains.txt", caption="📄 domains.txt"
+        )
+        sent_ids.append(d_msg.message_id)
+
+    # ── Fichier IPs ──
+    if all_ips:
+        buf       = BytesIO("\n".join(all_ips).encode())
+        buf.name  = "ips.txt"
+        i_msg     = await context.bot.send_document(
+            chat_id=chat_id, document=buf,
+            filename="ips.txt", caption="🌐 ips.txt"
+        )
+        sent_ids.append(i_msg.message_id)
+
+    # ── Bouton retour au menu ──
+    nav_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text="🏠 Que veux\\-tu faire ensuite ?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 Nouveau scan", callback_data="m:home"),
+        ]]),
+        parse_mode="MarkdownV2",
+    )
+    sent_ids.append(nav_msg.message_id)
+    context.user_data["bot_msgs"] = sent_ids
+    return ST_MENU
+
+
+# ── Message texte inattendu ───────────────────────────────────────────────────
+
+async def on_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await replace(update, context,
+                  "⬆️ Utilise les boutons ci\\-dessus ou tape /start\\.",
+                  InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="m:home")]]))
+    return ST_MENU
+
+
+# ── Lancement ─────────────────────────────────────────────────────────────────
 
 def main():
-    if BOT_TOKEN == "METS_TON_TOKEN_ICI":
-        print("❌ Configure BOT_TOKEN dans bot.py ou via la variable d'env BOT_TOKEN")
+    if not BOT_TOKEN:
+        print("❌ BOT_TOKEN manquant. Crée un fichier .env avec BOT_TOKEN=<token>")
         return
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
         entry_points=[
-            CommandHandler("start", cmd_start),
-            CommandHandler("index", lambda u, c: (
-                u.message.reply_text("🗂 URL de l'index Apache ?") or STATE_INDEX_URL
-            )),
-            CommandHandler("url",   lambda u, c: (
-                u.message.reply_text("🔗 URL cible ?") or STATE_URL_URL
-            )),
-            CommandHandler("bgp",   lambda u, c: (
-                u.message.reply_text("🌐 Numéro ASN ?") or STATE_BGP_ASN
-            )),
-            CommandHandler("ripe",  lambda u, c: (
-                u.message.reply_text("📡 Terme de recherche RIPE ?") or STATE_RIPE_QUERY
-            )),
-            MessageHandler(filters.Document.ALL, handle_file),
+            CommandHandler("start",   cmd_start),
+            CommandHandler("help",    cmd_help),
+            MessageHandler(filters.Document.ALL, on_file),
+            CallbackQueryHandler(on_callback),
         ],
         states={
-            STATE_MENU:          [CallbackQueryHandler(callback_menu),
-                                  MessageHandler(filters.Document.ALL, handle_file)],
-            STATE_INDEX_URL:     [MessageHandler(filters.TEXT & ~filters.COMMAND, index_get_url)],
-            STATE_INDEX_EXT:     [MessageHandler(filters.TEXT & ~filters.COMMAND, index_get_ext)],
-            STATE_INDEX_WORKERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, index_get_workers)],
-            STATE_INDEX_LIMIT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, index_get_limit)],
-            STATE_URL_URL:       [MessageHandler(filters.TEXT & ~filters.COMMAND, url_get_url)],
-            STATE_URL_WORKERS:   [MessageHandler(filters.TEXT & ~filters.COMMAND, url_get_workers)],
-            STATE_BGP_ASN:       [MessageHandler(filters.TEXT & ~filters.COMMAND, bgp_get_asn)],
-            STATE_RIPE_QUERY:    [MessageHandler(filters.TEXT & ~filters.COMMAND, ripe_get_query)],
+            ST_MENU: [
+                CallbackQueryHandler(on_callback),
+                MessageHandler(filters.Document.ALL, on_file),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_menu),
+            ],
+            ST_IDX_URL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, idx_url),
+                CallbackQueryHandler(on_callback),
+            ],
+            ST_IDX_EXT: [
+                CallbackQueryHandler(on_callback),                          # boutons ext:*
+                MessageHandler(filters.TEXT & ~filters.COMMAND, idx_ext_text),  # texte manuel
+            ],
+            ST_IDX_WORKERS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, idx_workers),
+                CallbackQueryHandler(on_callback),
+            ],
+            ST_IDX_LIMIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, idx_limit),
+                CallbackQueryHandler(on_callback),
+            ],
+            ST_URL_TARGET: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, url_target),
+                CallbackQueryHandler(on_callback),
+            ],
+            ST_URL_WORKERS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, url_workers),
+                CallbackQueryHandler(on_callback),
+            ],
+            ST_BGP_ASN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bgp_asn),
+                CallbackQueryHandler(on_callback),
+            ],
+            ST_RIPE_QUERY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ripe_query),
+                CallbackQueryHandler(on_callback),
+            ],
         },
-        fallbacks=[CommandHandler("annuler", cmd_cancel),
-                   CommandHandler("help", cmd_help)],
+        fallbacks=[
+            CommandHandler("annuler", cmd_cancel),
+            CommandHandler("start",   cmd_start),
+        ],
         allow_reentry=True,
+        per_user=True,
+        per_chat=True,
     )
 
     app.add_handler(conv)
-    app.add_handler(CommandHandler("help", cmd_help))
-
     print("🚀 ZeuScraper Bot démarré. Ctrl+C pour arrêter.")
     app.run_polling(drop_pending_updates=True)
 
