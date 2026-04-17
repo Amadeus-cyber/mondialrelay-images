@@ -2,16 +2,20 @@
 """
 Domain & IP Range Scraper
 Usage: python scraper.py --url <url> [options]
+       python scraper.py --index <url> [--ext txt,gz] [--limit N] [--workers N]
        python scraper.py --source <bgp|ripe|arin|spamhaus> [--query <asn|org>]
 """
 
 import re
 import sys
 import csv
+import gzip
 import json
 import time
 import argparse
 import ipaddress
+import threading
+from io import BytesIO
 from urllib.parse import urlparse, urljoin
 
 try:
@@ -21,12 +25,12 @@ except ImportError:
     print("Missing deps. Run: pip install requests beautifulsoup4")
     sys.exit(1)
 
-# ── Regex patterns ──────────────────────────────────────────────────────────
+# ── Regex patterns ───────────────────────────────────────────────────────────
 
 CIDR_PATTERN = re.compile(
-    r'\b(?:\d{1,3}\.){3}\d{1,3}/\d{1,2}\b'           # IPv4 CIDR
+    r'\b(?:\d{1,3}\.){3}\d{1,3}/\d{1,2}\b'
     r'|'
-    r'\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}/\d{1,3}\b'  # IPv6 CIDR
+    r'(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}/\d{1,3}'
 )
 
 IPV4_PATTERN = re.compile(
@@ -38,7 +42,10 @@ DOMAIN_PATTERN = re.compile(
     r'+(?:com|net|org|io|fr|de|uk|ru|cn|info|biz|co|xyz|online|site|top|'
     r'cloud|tech|app|dev|edu|gov|mil|int|eu|us|ca|au|jp|br|in|nl|es|it|pl|'
     r'se|no|dk|fi|be|ch|at|cz|ro|hu|sk|bg|hr|si|lt|lv|ee|is|pt|gr|tr|il|'
-    r'ua|by|kz|ge|am|az|md|rs|me|mk|al|ba|xk|ly|gg|je|im|ax)\b',
+    r'ua|by|kz|ge|am|az|md|rs|me|mk|al|ba|xk|ly|gg|je|im|ax|mobi|me|cc|'
+    r'tv|pro|name|tel|xxx|ws|ms|nu|pw|academy|agency|blog|club|design|email|'
+    r'global|group|host|link|live|media|news|network|one|plus|shop|social|'
+    r'store|studio|support|systems|today|web|works|world|zone)\b',
     re.IGNORECASE
 )
 
@@ -49,13 +56,14 @@ SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate",
 })
 
 
-def fetch(url: str, retries: int = 3, timeout: int = 15) -> requests.Response | None:
+def fetch(url: str, retries: int = 3, timeout: int = 30, stream: bool = False) -> requests.Response | None:
     for attempt in range(retries):
         try:
-            r = SESSION.get(url, timeout=timeout)
+            r = SESSION.get(url, timeout=timeout, stream=stream)
             r.raise_for_status()
             return r
         except requests.RequestException as e:
@@ -68,11 +76,10 @@ def fetch(url: str, retries: int = 3, timeout: int = 15) -> requests.Response | 
 # ── Parsers ──────────────────────────────────────────────────────────────────
 
 def extract_from_text(text: str) -> dict:
-    cidrs = set(CIDR_PATTERN.findall(text))
-    ips   = set(IPV4_PATTERN.findall(text)) - {ip for cidr in cidrs for ip in [cidr.split('/')[0]]}
+    cidrs   = set(CIDR_PATTERN.findall(text))
+    ips     = set(IPV4_PATTERN.findall(text)) - {c.split('/')[0] for c in cidrs}
     domains = set(DOMAIN_PATTERN.findall(text))
 
-    # Validate CIDRs
     valid_cidrs = set()
     for cidr in cidrs:
         try:
@@ -81,7 +88,6 @@ def extract_from_text(text: str) -> dict:
         except ValueError:
             pass
 
-    # Validate IPs
     valid_ips = set()
     for ip in ips:
         try:
@@ -92,6 +98,96 @@ def extract_from_text(text: str) -> dict:
 
     return {"cidrs": valid_cidrs, "ips": valid_ips, "domains": domains}
 
+
+def decode_response(resp: requests.Response, url: str) -> str:
+    """Decode response body, handling gzip content."""
+    ct = resp.headers.get("Content-Type", "")
+    if url.endswith(".gz") or "gzip" in ct:
+        try:
+            return gzip.decompress(resp.content).decode("utf-8", errors="replace")
+        except Exception:
+            pass
+    return resp.text
+
+
+# ── Apache index scraper ─────────────────────────────────────────────────────
+
+def list_apache_index(index_url: str, exts: list[str]) -> list[str]:
+    """Parse an Apache autoindex page and return all file URLs matching exts."""
+    print(f"  Fetching index: {index_url}")
+    resp = fetch(index_url)
+    if not resp:
+        return []
+
+    soup  = BeautifulSoup(resp.text, "html.parser")
+    base  = index_url.rstrip("/") + "/"
+    files = []
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        # Skip Apache sort/parent links
+        if href.startswith("?") or href.startswith("/") and href == urlparse(index_url).path:
+            continue
+        if href in ("../", "./", "/"):
+            continue
+        full = urljoin(base, href)
+        # Only keep same-host files (not parent dir navigation)
+        if urlparse(full).netloc != urlparse(index_url).netloc:
+            continue
+        ext = href.split("?")[0].rsplit(".", 1)[-1].lower()
+        if ext in exts:
+            files.append(full)
+
+    print(f"  Found {len(files)} file(s) matching extensions: {exts}")
+    return files
+
+
+def scrape_index(index_url: str, exts: list[str], limit: int, workers: int) -> dict:
+    """Download and parse all files from an Apache directory listing."""
+    files = list_apache_index(index_url, exts)
+    if limit:
+        files = files[:limit]
+        if limit < len(files):
+            print(f"  Limiting to first {limit} files")
+
+    results  = {"cidrs": set(), "ips": set(), "domains": set()}
+    lock     = threading.Lock()
+    done     = [0]
+    total    = len(files)
+
+    def process(url: str):
+        resp = fetch(url, timeout=60)
+        if not resp:
+            return
+        text = decode_response(resp, url)
+        data = extract_from_text(text)
+        with lock:
+            results["cidrs"]   |= data["cidrs"]
+            results["ips"]     |= data["ips"]
+            results["domains"] |= data["domains"]
+            done[0] += 1
+            print(f"  [{done[0]}/{total}] {url.split('/')[-1]} "
+                  f"— +{len(data['domains'])} domains, +{len(data['cidrs'])} CIDRs")
+
+    threads = []
+    sem     = threading.Semaphore(workers)
+
+    def worker(url):
+        with sem:
+            process(url)
+
+    for url in files:
+        t = threading.Thread(target=worker, args=(url,), daemon=True)
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join()
+
+    return results
+
+
+# ── Generic URL scraper ───────────────────────────────────────────────────────
 
 def scrape_url(url: str, follow_links: bool = False, depth: int = 1) -> dict:
     results = {"cidrs": set(), "ips": set(), "domains": set()}
@@ -106,13 +202,13 @@ def scrape_url(url: str, follow_links: bool = False, depth: int = 1) -> dict:
         if not resp:
             return
 
-        content_type = resp.headers.get("Content-Type", "")
+        text = decode_response(resp, target_url)
+        ct   = resp.headers.get("Content-Type", "")
 
-        if "text/plain" in content_type or target_url.endswith(".txt"):
-            data = extract_from_text(resp.text)
+        if "text/plain" in ct or target_url.endswith((".txt", ".gz", ".csv")):
+            data = extract_from_text(text)
         else:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            # Remove script/style noise
+            soup = BeautifulSoup(text, "html.parser")
             for tag in soup(["script", "style"]):
                 tag.decompose()
             data = extract_from_text(soup.get_text(separator="\n"))
@@ -128,7 +224,7 @@ def scrape_url(url: str, follow_links: bool = False, depth: int = 1) -> dict:
         results["cidrs"]   |= data["cidrs"]
         results["ips"]     |= data["ips"]
         results["domains"] |= data["domains"]
-        time.sleep(0.5)
+        time.sleep(0.3)
 
     _scrape(url, 1)
     return results
@@ -159,7 +255,8 @@ def source_bgp_he(asn_or_query: str) -> dict:
 def source_ripe(query: str) -> dict:
     """RIPE NCC REST API — public, no auth required."""
     print(f"  Source: RIPE NCC — query: {query}")
-    url  = f"https://rest.db.ripe.net/search.json?query-string={query}&type-filter=inetnum,inet6num&flags=no-filtering"
+    url  = (f"https://rest.db.ripe.net/search.json?query-string={query}"
+            f"&type-filter=inetnum,inet6num&flags=no-filtering")
     resp = fetch(url)
     if not resp:
         return {}
@@ -170,15 +267,13 @@ def source_ripe(query: str) -> dict:
             for attr in obj.get("attributes", {}).get("attribute", []):
                 if attr.get("name") in ("inetnum", "inet6num"):
                     val = attr.get("value", "")
-                    # Convert inetnum range to CIDR
                     if " - " in val:
                         try:
                             start, end = val.split(" - ")
-                            nets = list(ipaddress.summarize_address_range(
+                            for net in ipaddress.summarize_address_range(
                                 ipaddress.ip_address(start.strip()),
                                 ipaddress.ip_address(end.strip())
-                            ))
-                            for net in nets:
+                            ):
                                 cidrs.add(str(net))
                         except Exception:
                             pass
@@ -196,8 +291,8 @@ def source_ripe(query: str) -> dict:
 def source_spamhaus(query: str) -> dict:
     """Spamhaus DROP/EDROP lists — public block lists."""
     urls = {
-        "drop":  "https://www.spamhaus.org/drop/drop.txt",
-        "edrop": "https://www.spamhaus.org/drop/edrop.txt",
+        "drop":    "https://www.spamhaus.org/drop/drop.txt",
+        "edrop":   "https://www.spamhaus.org/drop/edrop.txt",
         "asndrop": "https://www.spamhaus.org/drop/asndrop.txt",
     }
     target = urls.get(query.lower(), urls["drop"])
@@ -216,8 +311,7 @@ def source_arin(query: str) -> dict:
     if not resp:
         return {}
     try:
-        data  = resp.json()
-        return extract_from_text(json.dumps(data))
+        return extract_from_text(json.dumps(resp.json()))
     except json.JSONDecodeError:
         return extract_from_text(resp.text)
 
@@ -233,7 +327,13 @@ SOURCES = {
 # ── Output ───────────────────────────────────────────────────────────────────
 
 def save_results(results: dict, output: str, fmt: str):
-    cidrs   = sorted(results.get("cidrs",   []), key=lambda x: ipaddress.ip_network(x, strict=False))
+    def sort_cidr(x):
+        try:
+            return ipaddress.ip_network(x, strict=False)
+        except ValueError:
+            return ipaddress.ip_network("0.0.0.0/32")
+
+    cidrs   = sorted(results.get("cidrs",   []), key=sort_cidr)
     ips     = sorted(results.get("ips",     []), key=lambda x: ipaddress.ip_address(x))
     domains = sorted(results.get("domains", []))
 
@@ -262,13 +362,9 @@ def save_results(results: dict, output: str, fmt: str):
 
     elif fmt == "json":
         with open(output, "w") as f:
-            json.dump({
-                "cidrs":   cidrs,
-                "ips":     ips,
-                "domains": domains,
-            }, f, indent=2)
+            json.dump({"cidrs": cidrs, "ips": ips, "domains": domains}, f, indent=2)
 
-    print(f"\n  Saved to: {output}")
+    print(f"  Saved → {output}")
 
 
 def print_summary(results: dict):
@@ -280,14 +376,21 @@ def print_summary(results: dict):
     print(f"  Individual IPs   : {len(ips)}")
     print(f"  Domains          : {len(domains)}")
     print(f"{'─'*40}")
+
+    def sort_cidr(x):
+        try:
+            return ipaddress.ip_network(x, strict=False)
+        except ValueError:
+            return ipaddress.ip_network("0.0.0.0/32")
+
     if cidrs:
-        print("\n[CIDR]")
-        for c in sorted(cidrs, key=lambda x: ipaddress.ip_network(x, strict=False))[:20]:
+        print("\n[CIDR — first 20]")
+        for c in sorted(cidrs, key=sort_cidr)[:20]:
             print(f"  {c}")
         if len(cidrs) > 20:
             print(f"  ... ({len(cidrs)-20} more)")
     if domains:
-        print("\n[Domains]")
+        print("\n[Domains — first 20]")
         for d in sorted(domains)[:20]:
             print(f"  {d}")
         if len(domains) > 20:
@@ -298,40 +401,47 @@ def print_summary(results: dict):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scrape domains and IP ranges from URLs or public sources.",
+        description="Scrape domains & IP ranges from Apache indexes, URLs, or public sources.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Scrape a specific URL
-  python scraper.py --url https://example.com/ip-list.txt
+  # Apache directory index (like Pulsedmedia) — main use case
+  python scraper.py --index https://le6-1-103at400.pulsedmedia.com/public-indexx/latest/domainlists/public/?C=S;O=D
 
-  # Scrape and follow internal links (depth 2)
+  # Limit to 10 files, 8 parallel workers, save as CSV
+  python scraper.py --index <url> --limit 10 --workers 8 -o out.csv --format csv
+
+  # Only download .txt files (exclude .gz)
+  python scraper.py --index <url> --ext txt
+
+  # Scrape a single URL
+  python scraper.py --url https://example.com/list.txt
+
+  # Follow internal links (depth 2)
   python scraper.py --url https://example.com --follow --depth 2
 
-  # Use Hurricane Electric BGP Toolkit for an ASN
+  # Built-in sources
   python scraper.py --source bgp --query 15169
-
-  # RIPE NCC query
-  python scraper.py --source ripe --query "Cloudflare"
-
-  # Spamhaus DROP list
+  python scraper.py --source ripe --query "OVH"
   python scraper.py --source spamhaus --query drop
-
-  # Save as JSON
-  python scraper.py --url https://example.com -o results.json --format json
         """
     )
-    parser.add_argument("--url",    help="Target URL to scrape")
-    parser.add_argument("--source", choices=SOURCES.keys(), help="Built-in source")
-    parser.add_argument("--query",  default="", help="Query string for built-in sources (ASN, org name, list name)")
-    parser.add_argument("--follow", action="store_true", help="Follow internal links")
-    parser.add_argument("--depth",  type=int, default=2, help="Link follow depth (default: 2)")
+
+    parser.add_argument("--index",   help="Apache directory index URL to crawl all files")
+    parser.add_argument("--url",     help="Single URL to scrape")
+    parser.add_argument("--source",  choices=SOURCES.keys(), help="Built-in source")
+    parser.add_argument("--query",   default="", help="Query for built-in sources")
+    parser.add_argument("--ext",     default="txt,gz", help="File extensions to download from index (default: txt,gz)")
+    parser.add_argument("--limit",   type=int, default=0, help="Max files to download from index (0 = all)")
+    parser.add_argument("--workers", type=int, default=5, help="Parallel download threads (default: 5)")
+    parser.add_argument("--follow",  action="store_true", help="Follow internal links (--url mode)")
+    parser.add_argument("--depth",   type=int, default=2, help="Link follow depth (default: 2)")
     parser.add_argument("-o", "--output", default="results.txt", help="Output file (default: results.txt)")
-    parser.add_argument("--format", choices=["txt", "csv", "json"], default="txt", help="Output format")
+    parser.add_argument("--format",  choices=["txt", "csv", "json"], default="txt", help="Output format")
 
     args = parser.parse_args()
 
-    if not args.url and not args.source:
+    if not args.index and not args.url and not args.source:
         parser.print_help()
         sys.exit(1)
 
@@ -339,6 +449,17 @@ Examples:
     print(f"{'─'*40}")
 
     results: dict = {"cidrs": set(), "ips": set(), "domains": set()}
+
+    if args.index:
+        print(f"  Mode    : Apache index crawl")
+        print(f"  Target  : {args.index}")
+        exts = [e.strip().lstrip(".").lower() for e in args.ext.split(",")]
+        print(f"  Ext     : {exts}")
+        print(f"  Workers : {args.workers}")
+        data = scrape_index(args.index, exts, args.limit, args.workers)
+        results["cidrs"]   |= data.get("cidrs",   set())
+        results["ips"]     |= data.get("ips",     set())
+        results["domains"] |= data.get("domains", set())
 
     if args.url:
         print(f"  Mode  : URL scraping")
@@ -350,8 +471,7 @@ Examples:
 
     if args.source:
         print(f"  Mode  : Built-in source [{args.source}]")
-        fn   = SOURCES[args.source]
-        data = fn(args.query)
+        data = SOURCES[args.source](args.query)
         results["cidrs"]   |= data.get("cidrs",   set())
         results["ips"]     |= data.get("ips",     set())
         results["domains"] |= data.get("domains", set())
