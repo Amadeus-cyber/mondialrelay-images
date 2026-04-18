@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-ZeuScraper — Bot Telegram
+ZeuScraper — Bot Telegram v3.1
 Lit le token depuis .env (BOT_TOKEN=...) ou variable d'environnement.
 """
 
 import os
+import asyncio
 import logging
 import tempfile
+import time
 from io import BytesIO
 from pathlib import Path
 
@@ -40,12 +42,30 @@ log = logging.getLogger(__name__)
 (
     ST_MENU,
     ST_IDX_URL, ST_IDX_EXT, ST_IDX_WORKERS, ST_IDX_LIMIT,
-    ST_URL_TARGET, ST_URL_WORKERS,
+    ST_URL_TARGET, ST_URL_FOLLOW, ST_URL_DEPTH, ST_URL_WORKERS,
     ST_BGP_ASN,
     ST_RIPE_QUERY,
-) = range(9)
+    ST_SETTINGS,
+) = range(12)
 
-# ── Clavier principal ─────────────────────────────────────────────────────────
+# ── Paramètres utilisateur ────────────────────────────────────────────────────
+
+DEFAULT_CFG = {
+    "workers_index": 5,
+    "workers_url":   3,
+    "timeout":       30,
+    "depth":         2,
+    "exts":          "txt,gz",
+    "limit":         0,
+}
+
+def get_cfg(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    cfg = context.user_data.setdefault("cfg", {})
+    for k, v in DEFAULT_CFG.items():
+        cfg.setdefault(k, v)
+    return cfg
+
+# ── Claviers ──────────────────────────────────────────────────────────────────
 
 KB_MAIN = InlineKeyboardMarkup([
     [
@@ -56,7 +76,10 @@ KB_MAIN = InlineKeyboardMarkup([
         InlineKeyboardButton("🌐  BGP / ASN",     callback_data="m:bgp"),
         InlineKeyboardButton("📡  RIPE NCC",      callback_data="m:ripe"),
     ],
-    [InlineKeyboardButton("ℹ️  Aide",            callback_data="m:help")],
+    [
+        InlineKeyboardButton("⚙️  Paramètres",    callback_data="m:settings"),
+        InlineKeyboardButton("ℹ️  Aide",          callback_data="m:help"),
+    ],
 ])
 
 KB_CANCEL = InlineKeyboardMarkup([[
@@ -70,37 +93,57 @@ KB_EXT = InlineKeyboardMarkup([
         InlineKeyboardButton("📋 csv",    callback_data="ext:csv"),
     ],
     [
-        InlineKeyboardButton("🗂 txt + gz",        callback_data="ext:txt,gz"),
-        InlineKeyboardButton("✅ TOUTES (*)",       callback_data="ext:*"),
+        InlineKeyboardButton("🗂 txt + gz",  callback_data="ext:txt,gz"),
+        InlineKeyboardButton("✅ TOUTES (*)", callback_data="ext:*"),
     ],
-    [InlineKeyboardButton("❌ Annuler",             callback_data="m:cancel")],
+    [InlineKeyboardButton("❌ Annuler",       callback_data="m:cancel")],
 ])
 
+KB_FOLLOW = InlineKeyboardMarkup([
+    [
+        InlineKeyboardButton("✅ Oui — suivre les liens", callback_data="follow:yes"),
+        InlineKeyboardButton("❌ Non",                    callback_data="follow:no"),
+    ],
+    [InlineKeyboardButton("❌ Annuler", callback_data="m:cancel")],
+])
+
+def kb_settings(cfg: dict) -> InlineKeyboardMarkup:
+    limit_lbl = str(cfg["limit"]) if cfg["limit"] else "∞"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"⚡ Workers Index  : {cfg['workers_index']}", callback_data="set:workers_index")],
+        [InlineKeyboardButton(f"⚡ Workers URL    : {cfg['workers_url']}",   callback_data="set:workers_url")],
+        [InlineKeyboardButton(f"⏱ Timeout        : {cfg['timeout']}s",      callback_data="set:timeout")],
+        [InlineKeyboardButton(f"🔁 Profondeur     : {cfg['depth']}",         callback_data="set:depth")],
+        [InlineKeyboardButton(f"📂 Extensions     : {cfg['exts']}",          callback_data="set:exts")],
+        [InlineKeyboardButton(f"🔢 Limite fichiers : {limit_lbl}",           callback_data="set:limit")],
+        [InlineKeyboardButton("🏠 Retour au menu",                            callback_data="m:home")],
+    ])
+
 BANNER_TEXT = (
-    "⚡ *ZeuScraper v3.0*\n"
+    "⚡ <b>ZeuScraper v3.1</b>\n"
     "━━━━━━━━━━━━━━━━━━━\n"
-    "Domain & IP Range Scraper\n\n"
-    "Choisis un mode ci\\-dessous, ou envoie directement "
-    "un fichier `.txt` pour extraire domaines et IPs automatiquement\\."
+    "Domain &amp; IP Range Scraper\n\n"
+    "Choisis un mode ci-dessous, ou envoie directement "
+    "un fichier <code>.txt</code> pour extraire domaines et IPs automatiquement."
 )
 
 HELP_TEXT = (
-    "📖 *ZeuScraper — Aide*\n\n"
-    "*Modes disponibles :*\n"
-    "🗂 *Index Apache* — Scrape tous les fichiers d'un répertoire web\n"
-    "🔗 *URL directe* — Scrape une page ou un fichier précis\n"
-    "🌐 *BGP/ASN* — Plages IP d'un ASN via BGP\\.HE\\.NET\n"
-    "📡 *RIPE NCC* — Plages IP via l'API RIPE\n\n"
-    "*Fichier direct :*\n"
-    "Envoie n'importe quel fichier `.txt` → extraction immédiate\n\n"
-    "*Commandes :*\n"
-    "`/start` `/help` `/annuler`"
+    "📖 <b>ZeuScraper — Aide</b>\n\n"
+    "<b>Modes disponibles :</b>\n"
+    "🗂 <b>Index Apache</b> — Scrape tous les fichiers d'un répertoire web\n"
+    "🔗 <b>URL directe</b> — Scrape une page ou un fichier précis\n"
+    "🌐 <b>BGP/ASN</b> — Plages IP d'un ASN via BGP.HE.NET\n"
+    "📡 <b>RIPE NCC</b> — Plages IP via l'API RIPE\n"
+    "⚙️ <b>Paramètres</b> — Workers, timeout, extensions, profondeur\n\n"
+    "<b>Fichier direct :</b>\n"
+    "Envoie n'importe quel fichier → extraction immédiate\n\n"
+    "<b>Commandes :</b>\n"
+    "<code>/start</code>  <code>/help</code>  <code>/annuler</code>"
 )
 
 # ── Helpers messages ──────────────────────────────────────────────────────────
 
 async def delete_msg(bot, chat_id: int, msg_id: int):
-    """Supprime silencieusement un message (ignore les erreurs si déjà supprimé)."""
     try:
         await bot.delete_message(chat_id=chat_id, message_id=msg_id)
     except BadRequest:
@@ -108,50 +151,18 @@ async def delete_msg(bot, chat_id: int, msg_id: int):
 
 
 async def replace(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                  text: str, keyboard=None, parse_mode="MarkdownV2") -> Message:
-    """
-    Envoie un nouveau message ET supprime le précédent bot-message stocké.
-    Stocke l'ID du nouveau message pour le prochain replace().
-    """
+                  text: str, keyboard=None, parse_mode="HTML") -> Message:
     chat_id  = update.effective_chat.id
     prev_ids = context.user_data.get("bot_msgs", [])
 
-    # Envoie d'abord le nouveau message
     msg = await context.bot.send_message(
         chat_id=chat_id,
         text=text,
         reply_markup=keyboard,
         parse_mode=parse_mode,
     )
-
-    # Supprime les anciens messages bot
     for mid in prev_ids:
         await delete_msg(context.bot, chat_id, mid)
-
-    # Essaie aussi de supprimer le message utilisateur déclencheur
-    trigger = update.message or (update.callback_query and update.callback_query.message)
-    if update.message:
-        await delete_msg(context.bot, chat_id, update.message.message_id)
-
-    context.user_data["bot_msgs"] = [msg.message_id]
-    return msg
-
-
-async def replace_doc(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                      buf: BytesIO, filename: str, caption: str) -> Message:
-    """Envoie un document en supprimant les anciens messages."""
-    chat_id  = update.effective_chat.id
-    prev_ids = context.user_data.get("bot_msgs", [])
-
-    msg = await context.bot.send_document(
-        chat_id=chat_id,
-        document=buf,
-        filename=filename,
-        caption=caption,
-    )
-    for mid in prev_ids:
-        await delete_msg(context.bot, chat_id, mid)
-
     if update.message:
         await delete_msg(context.bot, chat_id, update.message.message_id)
 
@@ -167,6 +178,7 @@ async def typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
 async def show_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("step_data", None)
+    context.user_data.pop("set_key", None)
     await replace(update, context, BANNER_TEXT, KB_MAIN)
     return ST_MENU
 
@@ -193,58 +205,153 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     await q.answer()
     data = q.data
 
-    if data == "m:home" or data == "m:cancel":
+    if data in ("m:home", "m:cancel"):
         context.user_data.pop("step_data", None)
+        context.user_data.pop("set_key", None)
         return await show_main(update, context)
 
     if data == "m:help":
         return await cmd_help(update, context)
 
-    # ── Choix de mode ──
+    # ── Paramètres ──
+    if data == "m:settings":
+        cfg = get_cfg(context)
+        await replace(update, context,
+                      "⚙️ <b>Paramètres</b>\n\nClique sur un paramètre pour le modifier.",
+                      kb_settings(cfg))
+        return ST_SETTINGS
+
+    if data.startswith("set:"):
+        return await settings_select(update, context, data[4:])
+
+    # ── Modes ──
     if data == "m:index":
         await replace(update, context,
-                      "🗂 *Index Apache*\n\n"
-                      "Envoie l'URL du répertoire à scraper\\.\n"
-                      "_ex: https://example\\.com/lists/_",
+                      "🗂 <b>Index Apache</b>\n\n"
+                      "Envoie l'URL du répertoire à scraper.\n"
+                      "<i>ex: https://example.com/lists/</i>",
                       KB_CANCEL)
         context.user_data["step_data"] = {"mode": "index"}
         return ST_IDX_URL
 
     if data == "m:url":
         await replace(update, context,
-                      "🔗 *URL directe*\n\nEnvoie l'URL de la page ou du fichier\\.",
+                      "🔗 <b>URL directe</b>\n\nEnvoie l'URL de la page ou du fichier.",
                       KB_CANCEL)
         context.user_data["step_data"] = {"mode": "url"}
         return ST_URL_TARGET
 
     if data == "m:bgp":
         await replace(update, context,
-                      "🌐 *BGP / ASN*\n\nEnvoie le numéro ASN\\.\n_ex: `15169` ou `AS15169`_",
+                      "🌐 <b>BGP / ASN</b>\n\nEnvoie le numéro ASN.\n<i>ex: 15169 ou AS15169</i>",
                       KB_CANCEL)
         context.user_data["step_data"] = {"mode": "bgp"}
         return ST_BGP_ASN
 
     if data == "m:ripe":
         await replace(update, context,
-                      "📡 *RIPE NCC*\n\nEnvoie ton terme de recherche \\(org, IP, réseau\\)\\.",
+                      "📡 <b>RIPE NCC</b>\n\nEnvoie ton terme de recherche (org, IP, réseau).",
                       KB_CANCEL)
         context.user_data["step_data"] = {"mode": "ripe"}
         return ST_RIPE_QUERY
 
-    # ── Choix d'extension via boutons ──
+    # ── Extensions ──
     if data.startswith("ext:"):
         val = data[4:]
-        sd  = context.user_data.setdefault("step_data", {})
-        sd["ext"] = val
-        label = "TOUTES les extensions" if val == "*" else f"`.{val}`"
+        cfg = get_cfg(context)
+        context.user_data.setdefault("step_data", {})["ext"] = val
+        label = "TOUTES les extensions" if val == "*" else f"<code>.{val}</code>"
         await replace(update, context,
-                      f"✅ Extensions : *{label}*\n\n"
-                      "⚡ Combien de *workers* \\(threads parallèles\\) ?\n\n"
-                      "_Entre un nombre entre 1 et 20, ou tape `5` pour le défaut\\._",
+                      f"✅ Extensions : {label}\n\n"
+                      f"⚡ Combien de <b>workers</b> (threads parallèles) ?\n"
+                      f"<i>Défaut : {cfg['workers_index']} — entre 1 et 20</i>",
                       KB_CANCEL)
         return ST_IDX_WORKERS
 
+    # ── Follow links ──
+    if data.startswith("follow:"):
+        follow = data[7:] == "yes"
+        cfg    = get_cfg(context)
+        context.user_data.setdefault("step_data", {})["follow"] = follow
+        if follow:
+            await replace(update, context,
+                          f"🔁 <b>Profondeur de suivi</b>\n\n"
+                          f"Jusqu'à combien de niveaux de liens suivre ?\n"
+                          f"<i>Défaut : {cfg['depth']}</i>",
+                          KB_CANCEL)
+            return ST_URL_DEPTH
+        else:
+            await replace(update, context,
+                          f"⚡ <b>Workers</b> (threads parallèles)\n\n"
+                          f"<i>Défaut : {cfg['workers_url']}</i>",
+                          KB_CANCEL)
+            return ST_URL_WORKERS
+
     return ST_MENU
+
+
+# ── Flux Settings ─────────────────────────────────────────────────────────────
+
+SET_LABELS = {
+    "workers_index": "⚡ Workers Index (1–20)",
+    "workers_url":   "⚡ Workers URL (1–20)",
+    "timeout":       "⏱ Timeout en secondes (5–300)",
+    "depth":         "🔁 Profondeur de suivi (1–10)",
+    "exts":          "📂 Extensions (ex: txt,gz  ou  * pour toutes)",
+    "limit":         "🔢 Limite de fichiers (0 = aucune)",
+}
+
+SET_INT_BOUNDS = {
+    "workers_index": (1, 20),
+    "workers_url":   (1, 20),
+    "timeout":       (5, 300),
+    "depth":         (1, 10),
+    "limit":         (0, 9999),
+}
+
+
+async def settings_select(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str) -> int:
+    cfg = get_cfg(context)
+    context.user_data["set_key"] = key
+    label   = SET_LABELS.get(key, key)
+    current = str(cfg.get(key, "?"))
+    await replace(update, context,
+                  f"⚙️ <b>{label}</b>\n\n"
+                  f"Valeur actuelle : <code>{current}</code>\n\n"
+                  f"Envoie la nouvelle valeur :",
+                  KB_CANCEL)
+    return ST_SETTINGS
+
+
+async def settings_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    key = context.user_data.get("set_key")
+    val = update.message.text.strip()
+    cfg = get_cfg(context)
+
+    if key in SET_INT_BOUNDS:
+        lo, hi = SET_INT_BOUNDS[key]
+        try:
+            cfg[key] = max(lo, min(hi, int(val)))
+        except ValueError:
+            pass
+    elif key == "exts":
+        cfg[key] = val
+
+    if update.message:
+        await delete_msg(context.bot, update.effective_chat.id, update.message.message_id)
+
+    prev_ids = context.user_data.get("bot_msgs", [])
+    for mid in prev_ids:
+        await delete_msg(context.bot, update.effective_chat.id, mid)
+
+    msg = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="⚙️ <b>Paramètres</b>\n\nClique sur un paramètre pour le modifier.",
+        reply_markup=kb_settings(cfg),
+        parse_mode="HTML",
+    )
+    context.user_data["bot_msgs"] = [msg.message_id]
+    return ST_SETTINGS
 
 
 # ── Flux Index Apache ─────────────────────────────────────────────────────────
@@ -253,67 +360,103 @@ async def idx_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     url = update.message.text.strip()
     context.user_data.setdefault("step_data", {})["url"] = url
     await replace(update, context,
-                  "📂 *Quelles extensions télécharger ?*\n\n"
-                  "Choisis ci\\-dessous ou tape manuellement \\(ex: `txt,gz,csv`\\)\\.",
+                  "📂 <b>Quelles extensions télécharger ?</b>\n\n"
+                  "Choisis ci-dessous ou tape manuellement (ex: <code>txt,gz,csv</code>).",
                   KB_EXT)
     return ST_IDX_EXT
 
 
 async def idx_ext_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Reçoit l'extension tapée manuellement."""
     raw = update.message.text.strip()
     context.user_data.setdefault("step_data", {})["ext"] = raw
-    label = "TOUTES" if raw in ("*", "all", "toutes") else f"`{raw}`"
+    cfg   = get_cfg(context)
+    label = "TOUTES" if raw in ("*", "all", "toutes") else f"<code>{raw}</code>"
     await replace(update, context,
-                  f"✅ Extensions : *{label}*\n\n"
-                  "⚡ Combien de *workers* \\(threads\\) ?\n_Défaut : `5`_",
+                  f"✅ Extensions : {label}\n\n"
+                  f"⚡ Combien de <b>workers</b> (threads) ?\n"
+                  f"<i>Défaut : {cfg['workers_index']}</i>",
                   KB_CANCEL)
     return ST_IDX_WORKERS
 
 
 async def idx_workers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cfg = get_cfg(context)
     try:
         w = max(1, min(20, int(update.message.text.strip())))
     except ValueError:
-        w = 5
+        w = cfg["workers_index"]
     context.user_data["step_data"]["workers"] = w
+    limit_lbl = str(cfg["limit"]) if cfg["limit"] else "∞"
     await replace(update, context,
-                  "🔢 *Limite de fichiers ?*\n\n"
-                  "Entre un nombre \\(ex: `50`\\) ou `0` pour *tous*\\.",
+                  f"🔢 <b>Limite de fichiers ?</b>\n\n"
+                  f"Entre un nombre (ex: <code>50</code>) ou <code>0</code> pour <b>tous</b>.\n"
+                  f"<i>Défaut : {limit_lbl}</i>",
                   KB_CANCEL)
     return ST_IDX_LIMIT
 
 
 async def idx_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cfg = get_cfg(context)
     try:
         limit = max(0, int(update.message.text.strip()))
     except ValueError:
-        limit = 0
+        limit = cfg["limit"]
 
     sd      = context.user_data["step_data"]
     url     = sd["url"]
-    raw_ext = sd.get("ext", "txt,gz")
+    raw_ext = sd.get("ext", cfg["exts"])
     exts    = [] if raw_ext.strip() in ("*", "all", "toutes", "tout") else [
         e.strip().lstrip(".").lower() for e in raw_ext.split(",") if e.strip()
     ]
-    workers = sd.get("workers", 5)
+    workers = sd.get("workers", cfg["workers_index"])
     ext_lbl = "toutes" if not exts else ",".join(exts)
 
-    await replace(update, context,
-                  f"⏳ *Scraping en cours…*\n\n"
-                  f"🔗 `{url}`\n"
-                  f"📂 Extensions : `{ext_lbl}`\n"
-                  f"⚡ Workers : `{workers}`\n"
-                  f"🔢 Limite : `{limit or 'aucune'}`\n\n"
-                  "_Patiente, ça peut prendre du temps\\.\\.\\._")
-
+    prog_msg = await replace(
+        update, context,
+        f"⏳ <b>Scraping en cours…</b>\n\n"
+        f"🔗 <code>{url}</code>\n"
+        f"📂 Extensions : <code>{ext_lbl}</code>\n"
+        f"⚡ Workers : <code>{workers}</code>\n"
+        f"🔢 Limite : <code>{limit or '∞'}</code>\n\n"
+        f"<i>Démarrage…</i>"
+    )
     await typing(context, update.effective_chat.id)
 
-    results, total = await context.application.loop.run_in_executor(
-        None, lambda: scrape_index(url, exts, limit, workers)
+    chat_id   = update.effective_chat.id
+    loop      = asyncio.get_running_loop()
+    last_edit = [0.0]
+
+    async def _edit(done, total, fname):
+        pct = int(done / total * 10) if total else 0
+        bar = "█" * pct + "░" * (10 - pct)
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=prog_msg.message_id,
+                text=(
+                    f"⏳ <b>Scraping en cours…</b>\n\n"
+                    f"🔗 <code>{url}</code>\n"
+                    f"[{bar}] <b>{done}/{total}</b>\n\n"
+                    f"📄 <code>{fname}</code>"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    def progress_cb(done, total, file_url, data):
+        now = time.monotonic()
+        if now - last_edit[0] < 2.0 and done < total:
+            return
+        last_edit[0] = now
+        fname = file_url.split("/")[-1][:40]
+        asyncio.run_coroutine_threadsafe(_edit(done, total, fname), loop)
+
+    results, total_files = await asyncio.to_thread(
+        scrape_index, url, exts, limit, workers, progress_cb
     )
     context.user_data.pop("step_data", None)
-    return await send_results(update, context, results, f"Index Apache · {total} fichiers")
+    return await send_results(update, context, results, f"Index Apache · {total_files} fichiers")
 
 
 # ── Flux URL directe ──────────────────────────────────────────────────────────
@@ -322,27 +465,47 @@ async def url_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     url = update.message.text.strip()
     context.user_data["step_data"]["url"] = url
     await replace(update, context,
-                  "⚡ *Combien de workers \\(threads\\) ?*\n\n_Défaut : `3`_",
+                  "🔗 <b>Suivre les liens internes ?</b>\n\n"
+                  "Si activé, le bot crawle toutes les pages liées du même domaine.",
+                  KB_FOLLOW)
+    return ST_URL_FOLLOW
+
+
+async def url_depth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cfg = get_cfg(context)
+    try:
+        depth = max(1, min(10, int(update.message.text.strip())))
+    except ValueError:
+        depth = cfg["depth"]
+    context.user_data["step_data"]["depth"] = depth
+    await replace(update, context,
+                  f"⚡ <b>Workers</b> (threads parallèles)\n\n<i>Défaut : {cfg['workers_url']}</i>",
                   KB_CANCEL)
     return ST_URL_WORKERS
 
 
 async def url_workers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cfg = get_cfg(context)
     try:
         w = max(1, min(20, int(update.message.text.strip())))
     except ValueError:
-        w = 3
+        w = cfg["workers_url"]
 
-    url = context.user_data["step_data"]["url"]
+    sd     = context.user_data["step_data"]
+    url    = sd["url"]
+    follow = sd.get("follow", False)
+    depth  = sd.get("depth", cfg["depth"])
 
     await replace(update, context,
-                  f"⏳ *Scraping en cours…*\n\n🔗 `{url}`\n⚡ Workers : `{w}`\n\n"
-                  "_Patiente\\.\\.\\._")
+                  f"⏳ <b>Scraping en cours…</b>\n\n"
+                  f"🔗 <code>{url}</code>\n"
+                  f"🔁 Follow links : <code>{'Oui' if follow else 'Non'}</code>\n"
+                  f"📐 Profondeur : <code>{depth}</code>\n"
+                  f"⚡ Workers : <code>{w}</code>\n\n"
+                  f"<i>Patiente…</i>")
     await typing(context, update.effective_chat.id)
 
-    results = await context.application.loop.run_in_executor(
-        None, lambda: scrape_url(url, follow=False, depth=1, workers=w)
-    )
+    results = await asyncio.to_thread(scrape_url, url, follow, depth, w)
     context.user_data.pop("step_data", None)
     return await send_results(update, context, results, f"URL · {url[:40]}")
 
@@ -352,12 +515,10 @@ async def url_workers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 async def bgp_asn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     asn = update.message.text.strip().upper().replace("AS", "")
     await replace(update, context,
-                  f"⏳ *Requête BGP…*\n\nAS`{asn}`\n\n_Patiente\\.\\.\\._")
+                  f"⏳ <b>Requête BGP…</b>\n\nAS<code>{asn}</code>\n\n<i>Patiente…</i>")
     await typing(context, update.effective_chat.id)
 
-    results = await context.application.loop.run_in_executor(
-        None, lambda: scrape_bgp(asn)
-    )
+    results = await asyncio.to_thread(scrape_bgp, asn)
     return await send_results(update, context, results, f"BGP AS{asn}")
 
 
@@ -366,23 +527,21 @@ async def bgp_asn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def ripe_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.message.text.strip()
     await replace(update, context,
-                  f"⏳ *Requête RIPE…*\n\n`{query}`\n\n_Patiente\\.\\.\\._")
+                  f"⏳ <b>Requête RIPE…</b>\n\n<code>{query}</code>\n\n<i>Patiente…</i>")
     await typing(context, update.effective_chat.id)
 
-    results = await context.application.loop.run_in_executor(
-        None, lambda: scrape_ripe(query)
-    )
+    results = await asyncio.to_thread(scrape_ripe, query)
     return await send_results(update, context, results, f"RIPE · {query}")
 
 
-# ── Fichier .txt reçu ─────────────────────────────────────────────────────────
+# ── Fichier reçu ──────────────────────────────────────────────────────────────
 
 async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     doc = update.message.document
     if not doc:
         return ST_MENU
 
-    await replace(update, context, "📥 *Fichier reçu…* extraction en cours\\.")
+    await replace(update, context, "📥 <b>Fichier reçu…</b> extraction en cours.")
     await typing(context, update.effective_chat.id)
 
     tg_file = await context.bot.get_file(doc.file_id)
@@ -411,50 +570,46 @@ async def send_results(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     if not domains and not all_ips:
         await replace(update, context,
-                      "⚠️ *Aucun résultat trouvé\\.*\n\nVérifie l'URL ou essaie un autre mode\\.",
+                      "⚠️ <b>Aucun résultat trouvé.</b>\n\nVérifie l'URL ou essaie un autre mode.",
                       InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="m:home")]]))
         return ST_MENU
 
-    # ── Résumé ──
     summary = (
-        f"✅ *Scraping terminé*\n"
-        f"_{label}_\n\n"
-        f"📄 Domaines  : `{len(domains)}`\n"
-        f"🌐 IPs/CIDRs : `{len(all_ips)}`"
+        f"✅ <b>Scraping terminé</b>\n"
+        f"<i>{label}</i>\n\n"
+        f"📄 Domaines  : <code>{len(domains)}</code>\n"
+        f"🌐 IPs/CIDRs : <code>{len(all_ips)}</code>"
     )
     sum_msg = await context.bot.send_message(
-        chat_id=chat_id, text=summary, parse_mode="MarkdownV2"
+        chat_id=chat_id, text=summary, parse_mode="HTML"
     )
     sent_ids = [sum_msg.message_id]
 
-    # ── Fichier domaines ──
     if domains:
-        buf       = BytesIO("\n".join(domains).encode())
-        buf.name  = "domains.txt"
-        d_msg     = await context.bot.send_document(
+        buf      = BytesIO("\n".join(domains).encode())
+        buf.name = "domains.txt"
+        d_msg    = await context.bot.send_document(
             chat_id=chat_id, document=buf,
             filename="domains.txt", caption="📄 domains.txt"
         )
         sent_ids.append(d_msg.message_id)
 
-    # ── Fichier IPs ──
     if all_ips:
-        buf       = BytesIO("\n".join(all_ips).encode())
-        buf.name  = "ips.txt"
-        i_msg     = await context.bot.send_document(
+        buf      = BytesIO("\n".join(all_ips).encode())
+        buf.name = "ips.txt"
+        i_msg    = await context.bot.send_document(
             chat_id=chat_id, document=buf,
             filename="ips.txt", caption="🌐 ips.txt"
         )
         sent_ids.append(i_msg.message_id)
 
-    # ── Bouton retour au menu ──
     nav_msg = await context.bot.send_message(
         chat_id=chat_id,
-        text="🏠 Que veux\\-tu faire ensuite ?",
+        text="🏠 Que veux-tu faire ensuite ?",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🔄 Nouveau scan", callback_data="m:home"),
         ]]),
-        parse_mode="MarkdownV2",
+        parse_mode="HTML",
     )
     sent_ids.append(nav_msg.message_id)
     context.user_data["bot_msgs"] = sent_ids
@@ -465,7 +620,7 @@ async def send_results(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 async def on_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await replace(update, context,
-                  "⬆️ Utilise les boutons ci\\-dessus ou tape /start\\.",
+                  "⬆️ Utilise les boutons ci-dessus ou tape /start.",
                   InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="m:home")]]))
     return ST_MENU
 
@@ -497,8 +652,8 @@ def main():
                 CallbackQueryHandler(on_callback),
             ],
             ST_IDX_EXT: [
-                CallbackQueryHandler(on_callback),                          # boutons ext:*
-                MessageHandler(filters.TEXT & ~filters.COMMAND, idx_ext_text),  # texte manuel
+                CallbackQueryHandler(on_callback),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, idx_ext_text),
             ],
             ST_IDX_WORKERS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, idx_workers),
@@ -512,6 +667,13 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, url_target),
                 CallbackQueryHandler(on_callback),
             ],
+            ST_URL_FOLLOW: [
+                CallbackQueryHandler(on_callback),
+            ],
+            ST_URL_DEPTH: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, url_depth),
+                CallbackQueryHandler(on_callback),
+            ],
             ST_URL_WORKERS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, url_workers),
                 CallbackQueryHandler(on_callback),
@@ -523,6 +685,10 @@ def main():
             ST_RIPE_QUERY: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ripe_query),
                 CallbackQueryHandler(on_callback),
+            ],
+            ST_SETTINGS: [
+                CallbackQueryHandler(on_callback),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, settings_value),
             ],
         },
         fallbacks=[
