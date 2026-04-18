@@ -93,10 +93,13 @@ def extract(text: str) -> dict:
 # ── Scrapers ──────────────────────────────────────────────────────────────────
 
 def scrape_index(index_url: str, exts: list, limit: int, workers: int,
-                 progress_cb=None) -> dict:
+                 progress_cb=None) -> tuple[dict, int]:
+    """Scrape un index Apache. Retourne TOUJOURS (results, total)."""
+    empty = ({"cidrs": set(), "ips": set(), "domains": set()}, 0)
+
     resp = fetch(index_url)
     if not resp:
-        return {}
+        return empty
 
     soup  = BeautifulSoup(resp.text, "html.parser")
     base  = index_url.rstrip("/") + "/"
@@ -126,6 +129,9 @@ def scrape_index(index_url: str, exts: list, limit: int, workers: int,
     done    = [0]
     total   = len(files)
 
+    if total == 0:
+        return results, 0
+
     def process(url):
         r = fetch(url, timeout=60)
         if not r:
@@ -137,7 +143,10 @@ def scrape_index(index_url: str, exts: list, limit: int, workers: int,
             results["domains"] |= data["domains"]
             done[0] += 1
             if progress_cb:
-                progress_cb(done[0], total, url, data)
+                try:
+                    progress_cb(done[0], total, url, data)
+                except Exception:
+                    pass
 
     sem     = threading.Semaphore(workers)
     threads = []
@@ -157,26 +166,31 @@ def scrape_index(index_url: str, exts: list, limit: int, workers: int,
 
 
 def scrape_url(url: str, follow: bool = False, depth: int = 1,
-               workers: int = 1) -> dict:
+               workers: int = 3) -> dict:
+    """Scrape une URL. Si follow=True, suit les liens internes jusqu'à `depth`."""
     results = {"cidrs": set(), "ips": set(), "domains": set()}
     visited = set()
     lock    = threading.Lock()
+    sem     = threading.Semaphore(workers)
 
-    def _scrape(target: str, d: int):
-        if target in visited or d > depth:
-            return
+    queue = [(url, 1)]
+    qlock = threading.Lock()
+
+    def crawl_one(target: str, d: int):
         with lock:
             if target in visited:
-                return
+                return []
             visited.add(target)
 
         resp = fetch(target)
         if not resp:
-            return
+            return []
+
         text = decode_response(resp, target)
         ct   = resp.headers.get("Content-Type", "")
+        new_links = []
 
-        if "text/plain" in ct or target.endswith((".txt", ".gz", ".csv")):
+        if "text/plain" in ct or target.endswith((".txt", ".gz", ".csv", ".lst")):
             data = extract(text)
         else:
             soup = BeautifulSoup(text, "html.parser")
@@ -185,30 +199,42 @@ def scrape_url(url: str, follow: bool = False, depth: int = 1,
             data = extract(soup.get_text(separator="\n"))
             if follow and d < depth:
                 base = urlparse(target)
-                child_urls = []
                 for a in soup.find_all("a", href=True):
                     href = urljoin(target, a["href"])
                     if urlparse(href).netloc == base.netloc:
-                        child_urls.append(href)
-                sem     = threading.Semaphore(workers)
-                threads = []
-                def child_worker(u, dep):
-                    with sem:
-                        _scrape(u, dep)
-                for cu in child_urls:
-                    t = threading.Thread(target=child_worker, args=(cu, d+1), daemon=True)
-                    threads.append(t)
-                    t.start()
-                for t in threads:
-                    t.join()
+                        new_links.append((href, d + 1))
 
         with lock:
             results["cidrs"]   |= data["cidrs"]
             results["ips"]     |= data["ips"]
             results["domains"] |= data["domains"]
-        time.sleep(0.2)
 
-    _scrape(url, 1)
+        return new_links
+
+    while queue:
+        with qlock:
+            batch, queue = queue, []
+
+        threads = []
+        next_batch_lock = threading.Lock()
+        next_batch = []
+
+        def worker(target, d):
+            with sem:
+                links = crawl_one(target, d)
+                with next_batch_lock:
+                    next_batch.extend(links)
+
+        for target, d in batch:
+            t = threading.Thread(target=worker, args=(target, d), daemon=True)
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join()
+
+        with qlock:
+            queue.extend(next_batch)
+
     return results
 
 
