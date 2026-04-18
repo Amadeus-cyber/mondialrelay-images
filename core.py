@@ -93,7 +93,7 @@ def extract(text: str) -> dict:
 # ── Scrapers ──────────────────────────────────────────────────────────────────
 
 def scrape_index(index_url: str, exts: list, limit: int, workers: int,
-                 progress_cb=None) -> tuple[dict, int]:
+                 progress_cb=None, stop_event=None) -> tuple[dict, int]:
     """Scrape un index Apache. Retourne TOUJOURS (results, total)."""
     empty = ({"cidrs": set(), "ips": set(), "domains": set()}, 0)
 
@@ -156,6 +156,8 @@ def scrape_index(index_url: str, exts: list, limit: int, workers: int,
             process(url)
 
     for url in files:
+        if stop_event and stop_event.is_set():
+            break
         t = threading.Thread(target=worker, args=(url,), daemon=True)
         threads.append(t)
         t.start()

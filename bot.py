@@ -8,6 +8,7 @@ import os
 import asyncio
 import logging
 import tempfile
+import threading
 import time
 from io import BytesIO
 from pathlib import Path
@@ -51,8 +52,8 @@ log = logging.getLogger(__name__)
 # ── Paramètres utilisateur ────────────────────────────────────────────────────
 
 DEFAULT_CFG = {
-    "workers_index": 5,
-    "workers_url":   3,
+    "workers_index": 15,
+    "workers_url":   5,
     "timeout":       30,
     "depth":         2,
     "exts":          "txt,gz",
@@ -205,9 +206,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     await q.answer()
     data = q.data
 
+    if data == "m:abort":
+        # Annule un scan en cours
+        evt = context.user_data.get("stop_event")
+        if evt:
+            evt.set()
+        context.user_data.pop("step_data", None)
+        await replace(update, context,
+                      "🛑 <b>Scan annulé.</b>",
+                      InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="m:home")]]))
+        return ST_MENU
+
     if data in ("m:home", "m:cancel"):
         context.user_data.pop("step_data", None)
         context.user_data.pop("set_key", None)
+        evt = context.user_data.pop("stop_event", None)
+        if evt:
+            evt.set()
         return await show_main(update, context)
 
     if data == "m:help":
@@ -411,6 +426,13 @@ async def idx_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     workers = sd.get("workers", cfg["workers_index"])
     ext_lbl = "toutes" if not exts else ",".join(exts)
 
+    stop_event = threading.Event()
+    context.user_data["stop_event"] = stop_event
+
+    KB_ABORT = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🛑 Annuler le scan", callback_data="m:abort"),
+    ]])
+
     prog_msg = await replace(
         update, context,
         f"⏳ <b>Scraping en cours…</b>\n\n"
@@ -418,7 +440,8 @@ async def idx_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"📂 Extensions : <code>{ext_lbl}</code>\n"
         f"⚡ Workers : <code>{workers}</code>\n"
         f"🔢 Limite : <code>{limit or '∞'}</code>\n\n"
-        f"<i>Démarrage…</i>"
+        f"<i>Démarrage…</i>",
+        KB_ABORT
     )
     await typing(context, update.effective_chat.id)
 
@@ -427,8 +450,9 @@ async def idx_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     last_edit = [0.0]
 
     async def _edit(done, total, fname):
-        pct = int(done / total * 10) if total else 0
-        bar = "█" * pct + "░" * (10 - pct)
+        pct_val = int(done / total * 100) if total else 0
+        filled  = int(done / total * 10) if total else 0
+        bar     = "█" * filled + "░" * (10 - filled)
         try:
             await context.bot.edit_message_text(
                 chat_id=chat_id,
@@ -436,9 +460,10 @@ async def idx_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 text=(
                     f"⏳ <b>Scraping en cours…</b>\n\n"
                     f"🔗 <code>{url}</code>\n"
-                    f"[{bar}] <b>{done}/{total}</b>\n\n"
+                    f"[{bar}] <b>{pct_val}%</b>  ({done}/{total} fichiers)\n\n"
                     f"📄 <code>{fname}</code>"
                 ),
+                reply_markup=KB_ABORT,
                 parse_mode="HTML",
             )
         except Exception:
@@ -452,9 +477,24 @@ async def idx_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         fname = file_url.split("/")[-1][:40]
         asyncio.run_coroutine_threadsafe(_edit(done, total, fname), loop)
 
-    results, total_files = await asyncio.to_thread(
-        scrape_index, url, exts, limit, workers, progress_cb
-    )
+    try:
+        results, total_files = await asyncio.to_thread(
+            scrape_index, url, exts, limit, workers, progress_cb, stop_event
+        )
+    except Exception as exc:
+        log.exception("scrape_index error")
+        context.user_data.pop("stop_event", None)
+        context.user_data.pop("step_data", None)
+        await replace(update, context,
+                      f"❌ <b>Erreur pendant le scraping :</b>\n<code>{exc}</code>",
+                      InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="m:home")]]))
+        return ST_MENU
+
+    context.user_data.pop("stop_event", None)
+
+    if stop_event.is_set():
+        return ST_MENU  # déjà géré par m:abort
+
     context.user_data.pop("step_data", None)
     return await send_results(update, context, results, f"Index Apache · {total_files} fichiers")
 
@@ -496,16 +536,34 @@ async def url_workers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     follow = sd.get("follow", False)
     depth  = sd.get("depth", cfg["depth"])
 
+    KB_ABORT = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Annuler", callback_data="m:abort")]])
+    stop_event = threading.Event()
+    context.user_data["stop_event"] = stop_event
+
     await replace(update, context,
                   f"⏳ <b>Scraping en cours…</b>\n\n"
                   f"🔗 <code>{url}</code>\n"
                   f"🔁 Follow links : <code>{'Oui' if follow else 'Non'}</code>\n"
                   f"📐 Profondeur : <code>{depth}</code>\n"
                   f"⚡ Workers : <code>{w}</code>\n\n"
-                  f"<i>Patiente…</i>")
+                  f"<i>Patiente…</i>",
+                  KB_ABORT)
     await typing(context, update.effective_chat.id)
 
-    results = await asyncio.to_thread(scrape_url, url, follow, depth, w)
+    try:
+        results = await asyncio.to_thread(scrape_url, url, follow, depth, w)
+    except Exception as exc:
+        log.exception("scrape_url error")
+        context.user_data.pop("stop_event", None)
+        context.user_data.pop("step_data", None)
+        await replace(update, context,
+                      f"❌ <b>Erreur :</b>\n<code>{exc}</code>",
+                      InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="m:home")]]))
+        return ST_MENU
+
+    context.user_data.pop("stop_event", None)
+    if stop_event.is_set():
+        return ST_MENU
     context.user_data.pop("step_data", None)
     return await send_results(update, context, results, f"URL · {url[:40]}")
 
@@ -514,11 +572,26 @@ async def url_workers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 async def bgp_asn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     asn = update.message.text.strip().upper().replace("AS", "")
+    KB_ABORT = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Annuler", callback_data="m:abort")]])
+    stop_event = threading.Event()
+    context.user_data["stop_event"] = stop_event
     await replace(update, context,
-                  f"⏳ <b>Requête BGP…</b>\n\nAS<code>{asn}</code>\n\n<i>Patiente…</i>")
+                  f"⏳ <b>Requête BGP…</b>\n\nAS<code>{asn}</code>\n\n<i>Patiente…</i>",
+                  KB_ABORT)
     await typing(context, update.effective_chat.id)
 
-    results = await asyncio.to_thread(scrape_bgp, asn)
+    try:
+        results = await asyncio.to_thread(scrape_bgp, asn)
+    except Exception as exc:
+        log.exception("scrape_bgp error")
+        context.user_data.pop("stop_event", None)
+        await replace(update, context,
+                      f"❌ <b>Erreur BGP :</b>\n<code>{exc}</code>",
+                      InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="m:home")]]))
+        return ST_MENU
+    context.user_data.pop("stop_event", None)
+    if stop_event.is_set():
+        return ST_MENU
     return await send_results(update, context, results, f"BGP AS{asn}")
 
 
@@ -526,11 +599,26 @@ async def bgp_asn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def ripe_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.message.text.strip()
+    KB_ABORT = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Annuler", callback_data="m:abort")]])
+    stop_event = threading.Event()
+    context.user_data["stop_event"] = stop_event
     await replace(update, context,
-                  f"⏳ <b>Requête RIPE…</b>\n\n<code>{query}</code>\n\n<i>Patiente…</i>")
+                  f"⏳ <b>Requête RIPE…</b>\n\n<code>{query}</code>\n\n<i>Patiente…</i>",
+                  KB_ABORT)
     await typing(context, update.effective_chat.id)
 
-    results = await asyncio.to_thread(scrape_ripe, query)
+    try:
+        results = await asyncio.to_thread(scrape_ripe, query)
+    except Exception as exc:
+        log.exception("scrape_ripe error")
+        context.user_data.pop("stop_event", None)
+        await replace(update, context,
+                      f"❌ <b>Erreur RIPE :</b>\n<code>{exc}</code>",
+                      InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="m:home")]]))
+        return ST_MENU
+    context.user_data.pop("stop_event", None)
+    if stop_event.is_set():
+        return ST_MENU
     return await send_results(update, context, results, f"RIPE · {query}")
 
 
